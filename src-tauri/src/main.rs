@@ -7,6 +7,7 @@ pub mod ffmpeg_resolver;
 mod hardsub;
 mod hardware;
 mod logger;
+mod job_queue;
 mod media_preview;
 mod settings;
 mod transcribe;
@@ -1080,6 +1081,8 @@ fn main() {
 
     let hardware_monitor = Arc::new(Mutex::new(HardwareMonitor::new()));
     let app_logs = Arc::new(AppLogs::new());
+    let job_queue = job_queue::JobQueueState::new();
+
     let transcription_session = Arc::new(Mutex::new(TranscriptionSession {
         child_pid: None,
         phase: SessionPhase::Idle,
@@ -1202,11 +1205,20 @@ fn main() {
         .manage(HardwareState(hardware_monitor))
         .manage(LogState(app_logs))
         .manage(TranscriptionState(transcription_session))
+        .manage(job_queue)
         .manage(HardsubState(hardsub_session))
         .manage(DownloadState(download_session))
         .invoke_handler(tauri::generate_handler![
             load_settings,
             save_settings,
+
+            job_queue::get_job_queue,
+            job_queue::add_job_queue_files,
+            job_queue::move_queue_job,
+            job_queue::remove_queue_job,
+            job_queue::clear_job_queue,
+            job_queue::start_job_queue,
+
             check_build,
             probe_media_file,
             convert_media_file,
