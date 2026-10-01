@@ -1,11 +1,25 @@
 [[permission]]
 identifier = "allow-all-custom"
-description = "Allow all custom Whisper Desktop command invokes"
+description = "Allow all custom Transcriber command invokes"
 
 [permission.commands]
 allow = [
   "load_settings",
   "save_settings",
+
+  "get_job_queue",
+  "add_job_queue_files",
+  "move_queue_job",
+  "remove_queue_job",
+  "clear_job_queue",
+  "start_job_queue",
+  "cancel_queue_job",
+
+  "get_history_entries",
+  "get_history_entry",
+  "delete_history_entry",
+  "clear_history",
+
   "check_build",
   "probe_media_file",
   "convert_media_file",
@@ -49,14 +63,5 @@ allow = [
   "open_file_in_editor",
   "exit_app",
   "hide_to_tray",
-  "set_window_zoom",
-
-  "get_job_queue",
-  "add_job_queue_files",
-  "move_queue_job",
-  "remove_queue_job",
-  "clear_job_queue",
-  "start_job_queue",
-  "cancel_queue_job",
+  "set_window_zoom"
 ]
-

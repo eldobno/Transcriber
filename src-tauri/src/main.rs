@@ -6,6 +6,7 @@ mod downloader;
 pub mod ffmpeg_resolver;
 mod hardsub;
 mod hardware;
+mod history;
 mod logger;
 mod job_queue;
 mod media_preview;
@@ -1106,6 +1107,13 @@ fn main() {
 
     let app = tauri::Builder::default()
         .setup(move |_app| {
+            let history_path = _app.path().app_data_dir()?.join("history.sqlite3");
+            let history_state = history::HistoryState::new(history_path)
+                .map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::Other, error)
+                })?;
+            _app.manage(history_state);
+
             let media_server = Arc::new(
                 tauri::async_runtime::block_on(video_server::MediaServer::start())
                     .map_err(std::io::Error::other)?,
@@ -1227,6 +1235,11 @@ fn main() {
             job_queue::clear_job_queue,
             job_queue::start_job_queue,
             job_queue::cancel_queue_job,
+
+            history::get_history_entries,
+            history::get_history_entry,
+            history::delete_history_entry,
+            history::clear_history,
 
             check_build,
             probe_media_file,

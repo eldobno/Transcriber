@@ -41,6 +41,7 @@ futures-util = "0.3"
 encoding_rs = "0.8"
 sha2 = "0.10"
 keyring = "2.1"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [profile.release]
 lto = true

@@ -43,6 +43,8 @@ pub struct QueueJob {
     pub duration_ms: Option<u64>,
     pub speed_factor: Option<f64>,
     pub created_at_ms: u64,
+    pub started_at_ms: Option<u64>,
+    pub completed_at_ms: Option<u64>,
 
     #[serde(skip)]
     pub cancel_requested: bool,
@@ -135,6 +137,56 @@ fn is_supported_media(path: &str) -> bool {
         || crate::VIDEO_EXTENSIONS.contains(&extension.as_str())
 }
 
+fn history_context(
+    job: &QueueJob,
+    settings: &crate::settings::WhisperSettings,
+) -> crate::history::HistoryJobContext {
+    crate::history::HistoryJobContext {
+        id: job.id.clone(),
+        source_path: job.source_path.clone(),
+        file_name: job.file_name.clone(),
+        media_duration_sec: job.duration_sec,
+        model: settings.model_path.clone(),
+        backend: settings.selected_backend.clone(),
+        created_at_ms: job.created_at_ms,
+        started_at_ms: job.started_at_ms,
+    }
+}
+
+fn processing_duration_ms(job: &QueueJob) -> Option<u64> {
+    match (job.started_at_ms, job.completed_at_ms) {
+        (Some(started), Some(completed)) if completed >= started => Some(completed - started),
+        _ => None,
+    }
+}
+
+fn record_history_finished(
+    app: &AppHandle,
+    logs: &Arc<crate::logger::AppLogs>,
+    history: &crate::history::HistoryState,
+    job: &QueueJob,
+    settings: &crate::settings::WhisperSettings,
+) {
+    let finish = crate::history::HistoryFinish {
+        status: match job.status {
+            JobStatus::Completed => "completed",
+            JobStatus::Failed => "failed",
+            JobStatus::Cancelled => "cancelled",
+            _ => return,
+        }
+        .to_string(),
+        completed_at_ms: job.completed_at_ms.unwrap_or_else(now_ms),
+        processing_duration_ms: processing_duration_ms(job),
+        speed_factor: job.speed_factor,
+        output_files: job.output_files.clone(),
+        error: job.error.clone(),
+    };
+
+    if let Err(error) = history.record_finished(&history_context(job, settings), &finish) {
+        logs.log(app, "History", &error);
+    }
+}
+
 #[tauri::command]
 pub fn get_job_queue(state: State<'_, JobQueueState>) -> Result<JobQueueSnapshot, String> {
     let queue = state
@@ -200,6 +252,8 @@ pub async fn add_job_queue_files(
                 duration_ms: None,
                 speed_factor: None,
                 created_at_ms: now_ms(),
+                started_at_ms: None,
+                completed_at_ms: None,
                 cancel_requested: false,
             });
 
@@ -343,9 +397,11 @@ pub async fn cancel_queue_job(
     app: AppHandle,
     state: State<'_, JobQueueState>,
     session_state: State<'_, crate::TranscriptionState>,
+    log_state: State<'_, crate::LogState>,
+    history_state: State<'_, crate::history::HistoryState>,
     job_id: String,
 ) -> Result<JobQueueSnapshot, String> {
-    let should_cancel_session = {
+    let (should_cancel_session, terminal_job) = {
         let mut queue = state
             .0
             .lock()
@@ -359,6 +415,8 @@ pub async fn cancel_queue_job(
 
         let active = matches!(job.status, JobStatus::Converting | JobStatus::Transcribing);
 
+        let mut terminal_job = None;
+
         match job.status {
             JobStatus::Inspecting | JobStatus::Ready | JobStatus::Queued => {
                 job.cancel_requested = true;
@@ -366,6 +424,8 @@ pub async fn cancel_queue_job(
                 job.progress = 0.0;
                 job.message = Some("Cancelled".to_string());
                 job.error = None;
+                job.completed_at_ms = Some(now_ms());
+                terminal_job = Some(job.clone());
             }
 
             JobStatus::Converting | JobStatus::Transcribing => {
@@ -379,8 +439,13 @@ pub async fn cancel_queue_job(
         }
 
         emit_queue(&app, &queue);
-        active
+        (active, terminal_job)
     };
+
+    if let Some(job) = terminal_job {
+        let settings = crate::settings::load_settings_file();
+        record_history_finished(&app, &log_state.0, &history_state, &job, &settings);
+    }
 
     if should_cancel_session {
         // There is a very small gap between conversion and transcription where
@@ -413,6 +478,7 @@ pub async fn start_job_queue(
     state: State<'_, JobQueueState>,
     log_state: State<'_, crate::LogState>,
     session_state: State<'_, crate::TranscriptionState>,
+    history_state: State<'_, crate::history::HistoryState>,
     settings: crate::settings::WhisperSettings,
 ) -> Result<JobQueueSnapshot, String> {
     let queue_state = state.0.clone();
@@ -474,15 +540,27 @@ pub async fn start_job_queue(
             job.progress = 0.0;
             job.message = Some("Converting media".to_string());
             job.error = None;
+            job.started_at_ms = Some(now_ms());
+            job.completed_at_ms = None;
 
-            let data = (job.id.clone(), job.source_path.clone(), job.duration_sec);
+            let data = (
+                job.id.clone(),
+                job.source_path.clone(),
+                job.duration_sec,
+                job.clone(),
+            );
 
             emit_queue(&app, &queue);
 
             data
         };
 
-        let (job_id, source_path, duration_sec) = next_job;
+        let (job_id, source_path, duration_sec, started_job) = next_job;
+
+        if let Err(error) = history_state.record_started(&history_context(&started_job, &settings))
+        {
+            logs.log(&app, "History", &error);
+        }
 
         // ----------------------------------------------------
         // Existing Whisper Desktop FFmpeg pipeline
@@ -503,6 +581,8 @@ pub async fn start_job_queue(
                     .lock()
                     .map_err(|lock_error| format!("Queue lock error: {lock_error}"))?;
 
+                let mut terminal_job = None;
+
                 if let Some(job) = queue.jobs.iter_mut().find(|job| job.id == job_id) {
                     if job.cancel_requested || looks_cancelled(&error) {
                         job.status = JobStatus::Cancelled;
@@ -514,10 +594,18 @@ pub async fn start_job_queue(
                         job.message = Some("Conversion failed".to_string());
                         job.error = Some(error);
                     }
+
+                    job.completed_at_ms = Some(now_ms());
+                    terminal_job = Some(job.clone());
                 }
 
                 // A failed file must NOT stop the rest of the queue.
                 emit_queue(&app, &queue);
+
+                if let Some(job) = terminal_job {
+                    record_history_finished(&app, &logs, &history_state, &job, &settings);
+                }
+
                 continue;
             }
         };
@@ -539,6 +627,7 @@ pub async fn start_job_queue(
                     job.progress = 0.0;
                     job.message = Some("Cancelled".to_string());
                     job.error = None;
+                    job.completed_at_ms = Some(now_ms());
                     true
                 } else {
                     job.status = JobStatus::Transcribing;
@@ -556,6 +645,15 @@ pub async fn start_job_queue(
 
         if cancelled_before_transcription {
             let _ = std::fs::remove_file(&wav_path);
+
+            let queue = queue_state
+                .lock()
+                .map_err(|error| format!("Queue lock error: {error}"))?;
+
+            if let Some(job) = queue.jobs.iter().find(|job| job.id == job_id) {
+                record_history_finished(&app, &logs, &history_state, job, &settings);
+            }
+
             continue;
         }
 
@@ -595,9 +693,14 @@ pub async fn start_job_queue(
                     job.duration_ms = Some(result.duration_ms);
                     job.speed_factor = Some(result.speed_factor);
                     job.cancel_requested = false;
+                    job.completed_at_ms = Some(now_ms());
                 }
 
                 emit_queue(&app, &queue);
+
+                if let Some(job) = queue.jobs.iter().find(|job| job.id == job_id) {
+                    record_history_finished(&app, &logs, &history_state, job, &settings);
+                }
             }
 
             Err(error) => {
@@ -616,10 +719,16 @@ pub async fn start_job_queue(
                         job.message = Some("Transcription failed".to_string());
                         job.error = Some(error);
                     }
+
+                    job.completed_at_ms = Some(now_ms());
                 }
 
                 // Again: failure does not terminate the queue.
                 emit_queue(&app, &queue);
+
+                if let Some(job) = queue.jobs.iter().find(|job| job.id == job_id) {
+                    record_history_finished(&app, &logs, &history_state, job, &settings);
+                }
             }
         }
     }
