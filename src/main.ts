@@ -24,6 +24,8 @@ type QueueJob = {
     message: string | null;
     outputFiles: string[];
     error: string | null;
+    durationMs: number | null;
+    speedFactor: number | null;
     createdAtMs: number;
 };
 
@@ -45,6 +47,13 @@ type TranscribeProgress = {
     stage?: string;
 };
 
+type TranscribeMetrics = {
+    progress: number;
+    elapsedSec: number;
+    speedFactor: number;
+    etaSec: number;
+};
+
 type WhisperSettings = Record<string, any>;
 
 let settings: WhisperSettings | null = null;
@@ -57,6 +66,7 @@ let queue: QueueSnapshot = {
 
 let activeProgress = 0;
 let activeMessage = "";
+let activeMetrics: TranscribeMetrics | null = null;
 
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   <main>
@@ -93,6 +103,104 @@ function escapeHtml(value: string): string {
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#039;");
+}
+
+
+function formatDuration(seconds: number): string {
+    if (!Number.isFinite(seconds) || seconds < 0) {
+        return "—";
+    }
+
+    const rounded = Math.max(0, Math.round(seconds));
+    const hours = Math.floor(rounded / 3600);
+    const minutes = Math.floor((rounded % 3600) / 60);
+    const secs = rounded % 60;
+
+    if (hours > 0) {
+        return `${hours}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+    }
+
+    return `${minutes}:${String(secs).padStart(2, "0")}`;
+}
+
+function referenceSpeed(): number {
+    if (
+        activeMetrics &&
+        Number.isFinite(activeMetrics.speedFactor) &&
+        activeMetrics.speedFactor > 0
+    ) {
+        return activeMetrics.speedFactor;
+    }
+
+    const completedSpeeds = queue.jobs
+        .filter(
+            (job) =>
+                job.status === "completed" &&
+                job.speedFactor !== null &&
+                Number.isFinite(job.speedFactor) &&
+                (job.speedFactor ?? 0) > 0,
+        )
+        .map((job) => job.speedFactor as number);
+
+    if (completedSpeeds.length === 0) {
+        return 0;
+    }
+
+    return (
+        completedSpeeds.reduce((sum, speed) => sum + speed, 0) /
+        completedSpeeds.length
+    );
+}
+
+function estimatedJobSeconds(
+    job: QueueJob,
+    speed: number,
+): number | null {
+    if (
+        job.status === "completed" ||
+        job.status === "failed" ||
+        job.status === "cancelled"
+    ) {
+        return 0;
+    }
+
+    if (
+        (job.status === "converting" ||
+            job.status === "transcribing") &&
+        activeMetrics
+    ) {
+        return Math.max(0, activeMetrics.etaSec);
+    }
+
+    if (speed > 0 && job.durationSec > 0) {
+        return job.durationSec / speed;
+    }
+
+    return null;
+}
+
+function queueEtaSeconds(): number | null {
+    const speed = referenceSpeed();
+    let total = 0;
+    let hasEstimate = false;
+
+    for (const job of queue.jobs) {
+        const estimate = estimatedJobSeconds(job, speed);
+
+        if (estimate !== null) {
+            total += estimate;
+
+            if (
+                job.status !== "completed" &&
+                job.status !== "failed" &&
+                job.status !== "cancelled"
+            ) {
+                hasEstimate = true;
+            }
+        }
+    }
+
+    return hasEstimate ? total : 0;
 }
 
 function statusLabel(status: JobStatus): string {
@@ -152,6 +260,9 @@ function renderQueue() {
         (job) => job.status === "cancelled",
     ).length;
 
+    const speed = referenceSpeed();
+    const queueEta = queueEtaSeconds();
+
     summary.innerHTML = `
     <div style="
       padding:14px 16px;
@@ -170,6 +281,21 @@ function renderQueue() {
       Failed: ${failed}
       &nbsp;•&nbsp;
       Cancelled: ${cancelled}
+      ${
+        queue.running
+            ? `<br>Speed: ${
+                speed > 0
+                    ? `${speed.toFixed(2)}× realtime`
+                    : "measuring…"
+            }
+             &nbsp;•&nbsp;
+             Queue remaining: ${
+                queueEta !== null
+                    ? formatDuration(queueEta)
+                    : "measuring…"
+            }`
+            : ""
+    }
     </div>
   `;
 
@@ -205,6 +331,20 @@ function renderQueue() {
                     activeMessage && active
                         ? activeMessage
                         : job.message ?? "";
+
+                const speed = referenceSpeed();
+                const estimate = estimatedJobSeconds(job, speed);
+
+                const timingText =
+                    job.status === "transcribing" && activeMetrics
+                        ? `${activeMetrics.speedFactor.toFixed(2)}× • ${formatDuration(
+                            activeMetrics.etaSec,
+                        )} remaining`
+                        : job.status === "queued" && estimate !== null
+                            ? `~${formatDuration(estimate)} estimated`
+                            : job.status === "completed" && job.speedFactor
+                                ? `${job.speedFactor.toFixed(2)}× realtime`
+                                : "";
 
                 const outputs =
                     job.outputFiles.length > 0
@@ -270,6 +410,7 @@ function renderQueue() {
                 ">
                   ${statusLabel(job.status)}
                   ${progressText ? ` • ${progressText}` : ""}
+                  ${timingText ? ` • ${escapeHtml(timingText)}` : ""}
                   ${detailMessage ? ` • ${escapeHtml(detailMessage)}` : ""}
                 </div>
 
@@ -387,8 +528,18 @@ await listen<QueueSnapshot>(
         if (!hasActive) {
             activeProgress = 0;
             activeMessage = "";
+            activeMetrics = null;
         }
 
+        renderQueue();
+    },
+);
+
+await listen<TranscribeMetrics>(
+    "transcribe-metrics",
+    (event) => {
+        activeMetrics = event.payload;
+        activeProgress = event.payload.progress;
         renderQueue();
     },
 );
@@ -457,6 +608,7 @@ clearButton.addEventListener("click", async () => {
 
         activeProgress = 0;
         activeMessage = "";
+        activeMetrics = null;
         renderQueue();
     } catch (error) {
         summary.textContent =

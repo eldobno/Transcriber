@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncBufRead, BufReader};
-use tokio::process::Command;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 
 fn send_notification(app: &AppHandle, title: &str, body: &str) {
     let _ = app.notification().builder().title(title).body(body).show();
@@ -44,6 +44,15 @@ pub struct TranscribeProgress {
     pub stage: Option<String>,
 }
 
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscribeMetrics {
+    pub progress: f64,
+    pub elapsed_sec: f64,
+    pub speed_factor: f64,
+    pub eta_sec: f64,
+}
+
 #[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscriptionResult {
@@ -56,28 +65,36 @@ pub struct TranscriptionResult {
 pub async fn probe_file_metadata(app: Option<&AppHandle>, file_path: &str) -> FileMetadata {
     let path = Path::new(file_path);
     let mut meta = FileMetadata {
-        name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+        name: path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string(),
         path: file_path.to_string(),
         format: "Unknown".to_string(),
         size: "0 MB".to_string(),
         duration_sec: 0.0,
         exists: false,
     };
-    
+
     if !path.exists() {
         return meta;
     }
-    
+
     meta.exists = true;
-    
+
     // Size formatting
     if let Ok(fs_meta) = fs::metadata(path) {
         let size_mb = fs_meta.len() as f64 / 1024.0 / 1024.0;
         meta.size = format!("{:.1} MB", size_mb);
     }
-    
+
     // Format detection
-    let ext = path.extension().unwrap_or_default().to_string_lossy().to_lowercase();
+    let ext = path
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
     let ext_str = ext.as_str();
     if crate::VIDEO_EXTENSIONS.contains(&ext_str) {
         meta.format = "🎥 Video".to_string();
@@ -86,7 +103,7 @@ pub async fn probe_file_metadata(app: Option<&AppHandle>, file_path: &str) -> Fi
     } else {
         meta.format = "📁 File".to_string();
     }
-    
+
     // ffprobe for duration with 30s timeout
     let probe_path = if file_path.starts_with('-') {
         format!("./{}", file_path)
@@ -99,26 +116,26 @@ pub async fn probe_file_metadata(app: Option<&AppHandle>, file_path: &str) -> Fi
     probe_cmd.creation_flags(0x08000000);
     probe_cmd
         .args([
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
             &probe_path,
         ])
         .kill_on_drop(true);
 
-    let probe_res = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        probe_cmd.output(),
-    )
-    .await;
-    
+    let probe_res =
+        tokio::time::timeout(std::time::Duration::from_secs(30), probe_cmd.output()).await;
+
     if let Ok(Ok(out)) = probe_res {
         let out_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if let Ok(secs) = out_str.parse::<f64>() {
             meta.duration_sec = secs;
         }
     }
-    
+
     meta
 }
 
@@ -143,37 +160,49 @@ pub async fn convert_to_wav(
     session: Arc<std::sync::Mutex<crate::TranscriptionSession>>,
     file_path: String,
 ) -> Result<String, String> {
-    logs.log(&app, "FFmpeg", &format!("Starting conversion for: {}", file_path));
-    
+    logs.log(
+        &app,
+        "FFmpeg",
+        &format!("Starting conversion for: {}", file_path),
+    );
+
     // Register phase in session
     {
         let mut lock = session.lock().map_err(|e| format!("Lock error: {}", e))?;
         if lock.phase != crate::SessionPhase::Idle {
-            return Err("Another transcription, translation, or encoding task is already running.".to_string());
+            return Err(
+                "Another transcription, translation, or encoding task is already running."
+                    .to_string(),
+            );
         }
         lock.phase = crate::SessionPhase::Transcribing;
         lock.cancel_requested = false;
         lock.child_pid = None;
     }
-    let _session_guard = ActiveSessionGuard { session: session.clone() };
+    let _session_guard = ActiveSessionGuard {
+        session: session.clone(),
+    };
 
     // Generate temp wav file name in /tmp or system temp dir
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    
+
     let tmp_dir = std::env::temp_dir();
     let tmp_wav = tmp_dir.join(format!("whisper_tmp_{}.wav", timestamp));
     let tmp_wav_str = tmp_wav.to_str().ok_or("Invalid temp wav path")?.to_string();
-    
-    let _ = app.emit("transcribe-status", TranscribeProgress {
-        progress: 0.0,
-        message: "Converting to 16kHz WAV...".to_string(),
-        active: true,
-        stage: Some("converting".to_string()),
-    });
-    
+
+    let _ = app.emit(
+        "transcribe-status",
+        TranscribeProgress {
+            progress: 0.0,
+            message: "Converting to 16kHz WAV...".to_string(),
+            active: true,
+            stage: Some("converting".to_string()),
+        },
+    );
+
     let safe_input = if file_path.starts_with('-') {
         format!("./{}", file_path)
     } else {
@@ -183,12 +212,15 @@ pub async fn convert_to_wav(
 
     // Check cancellation before spawning
     if session.lock().map(|l| l.cancel_requested).unwrap_or(false) {
-        let _ = app.emit("transcribe-status", TranscribeProgress {
-            progress: 0.0,
-            message: "Aborted".to_string(),
-            active: false,
-            stage: Some("aborted".to_string()),
-        });
+        let _ = app.emit(
+            "transcribe-status",
+            TranscribeProgress {
+                progress: 0.0,
+                message: "Aborted".to_string(),
+                active: false,
+                stage: Some("aborted".to_string()),
+            },
+        );
         return Err("WAV conversion was cancelled by the user.".to_string());
     }
 
@@ -197,10 +229,14 @@ pub async fn convert_to_wav(
     cmd.creation_flags(0x08000000);
     cmd.args([
         "-y",
-        "-i", &safe_input,
-        "-ar", "16000",
-        "-ac", "1",
-        "-c:a", "pcm_s16le",
+        "-i",
+        &safe_input,
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
         &tmp_wav_str,
     ])
     .stdout(Stdio::piped())
@@ -214,9 +250,10 @@ pub async fn convert_to_wav(
     #[cfg(target_os = "linux")]
     crate::hardsub::apply_linux_media_env_tokio(&mut cmd);
 
-    let mut child = cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("Failed to execute FFmpeg ({}): {}", ffmpeg_bin.display(), e))?;
-        
+
     let pid = child.id();
     let is_cancelled = if let Ok(mut lock) = session.lock() {
         if lock.cancel_requested {
@@ -232,24 +269,33 @@ pub async fn convert_to_wav(
     if is_cancelled {
         let _ = child.kill().await;
         let _ = fs::remove_file(&tmp_wav);
-        let _ = app.emit("transcribe-status", TranscribeProgress {
-            progress: 0.0,
-            message: "Aborted".to_string(),
-            active: false,
-            stage: Some("aborted".to_string()),
-        });
+        let _ = app.emit(
+            "transcribe-status",
+            TranscribeProgress {
+                progress: 0.0,
+                message: "Aborted".to_string(),
+                active: false,
+                stage: Some("aborted".to_string()),
+            },
+        );
         return Err("WAV conversion was cancelled by the user.".to_string());
     }
-        
-    let stdout = child.stdout.take().ok_or("Failed to capture ffmpeg stdout")?;
-    let stderr = child.stderr.take().ok_or("Failed to capture ffmpeg stderr")?;
-    
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("Failed to capture ffmpeg stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("Failed to capture ffmpeg stderr")?;
+
     let mut stdout_reader = BufReader::new(stdout).lines();
     let mut stderr_reader = BufReader::new(stderr).lines();
-    
+
     let mut stdout_done = false;
     let mut stderr_done = false;
-    
+
     while !stdout_done || !stderr_done {
         tokio::select! {
             res = next_line_lossy(&mut stdout_reader), if !stdout_done => {
@@ -266,18 +312,24 @@ pub async fn convert_to_wav(
             }
         }
     }
-    
-    let status = child.wait().await.map_err(|e| format!("ffmpeg execution failed: {}", e))?;
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("ffmpeg execution failed: {}", e))?;
 
     let was_cancelled = session.lock().map(|l| l.cancel_requested).unwrap_or(false);
     if was_cancelled {
         let _ = fs::remove_file(&tmp_wav);
-        let _ = app.emit("transcribe-status", TranscribeProgress {
-            progress: 0.0,
-            message: "Aborted".to_string(),
-            active: false,
-            stage: Some("aborted".to_string()),
-        });
+        let _ = app.emit(
+            "transcribe-status",
+            TranscribeProgress {
+                progress: 0.0,
+                message: "Aborted".to_string(),
+                active: false,
+                stage: Some("aborted".to_string()),
+            },
+        );
         return Err("WAV conversion was cancelled by the user.".to_string());
     }
 
@@ -285,15 +337,22 @@ pub async fn convert_to_wav(
         let _ = fs::remove_file(&tmp_wav);
         return Err(format!("FFmpeg failed with exit code: {:?}", status.code()));
     }
-    
-    logs.log(&app, "FFmpeg", "WAV conversion finished successfully! Format: PCM 16-bit, 16kHz, Mono.");
-    let _ = app.emit("transcribe-status", TranscribeProgress {
-        progress: 1.0,
-        message: "Conversion complete! Ready to transcribe.".to_string(),
-        active: false,
-        stage: Some("wav_ready".to_string()),
-    });
-    
+
+    logs.log(
+        &app,
+        "FFmpeg",
+        "WAV conversion finished successfully! Format: PCM 16-bit, 16kHz, Mono.",
+    );
+    let _ = app.emit(
+        "transcribe-status",
+        TranscribeProgress {
+            progress: 1.0,
+            message: "Conversion complete! Ready to transcribe.".to_string(),
+            active: false,
+            stage: Some("wav_ready".to_string()),
+        },
+    );
+
     Ok(tmp_wav_str)
 }
 
@@ -320,15 +379,22 @@ pub async fn run_transcription(
     mut duration_sec: f64,
 ) -> Result<TranscriptionResult, String> {
     {
-        let mut lock = session.lock().map_err(|e| format!("Session lock error: {}", e))?;
+        let mut lock = session
+            .lock()
+            .map_err(|e| format!("Session lock error: {}", e))?;
         if lock.phase != crate::SessionPhase::Idle {
-            return Err("Another transcription, translation, or encoding task is already running.".to_string());
+            return Err(
+                "Another transcription, translation, or encoding task is already running."
+                    .to_string(),
+            );
         }
         lock.phase = crate::SessionPhase::Transcribing;
         lock.cancel_requested = false;
         lock.child_pid = None;
     }
-    let _guard = ActiveSessionGuard { session: session.clone() };
+    let _guard = ActiveSessionGuard {
+        session: session.clone(),
+    };
     let _wav_guard = FileGuard(std::path::PathBuf::from(&wav_path));
     let start_time = Instant::now();
     let file_name = Path::new(&settings.input_file)
@@ -336,27 +402,36 @@ pub async fn run_transcription(
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-        
+
     // Trigger OS-level notification
-    send_notification(&app, "Transcription Started", &format!("Processing {}...", file_name));
-        
+    send_notification(
+        &app,
+        "Transcription Started",
+        &format!("Processing {}...", file_name),
+    );
+
     let root = Path::new(&settings.models_dir);
     let backend_name = settings.selected_backend.to_lowercase();
     let exe_ext = std::env::consts::EXE_SUFFIX;
     let bin_name = format!("whisper-cli-{}{}", backend_name, exe_ext);
 
-    
     use tauri::Manager;
     let mut resolved_bin: Option<std::path::PathBuf> = None;
 
     // 1. Tauri BaseDirectory::Resource
-    if let Ok(p) = app.path().resolve(format!("resources/{}", bin_name), tauri::path::BaseDirectory::Resource) {
+    if let Ok(p) = app.path().resolve(
+        format!("resources/{}", bin_name),
+        tauri::path::BaseDirectory::Resource,
+    ) {
         if p.exists() {
             resolved_bin = Some(p);
         }
     }
     if resolved_bin.is_none() {
-        if let Ok(p) = app.path().resolve(&bin_name, tauri::path::BaseDirectory::Resource) {
+        if let Ok(p) = app
+            .path()
+            .resolve(&bin_name, tauri::path::BaseDirectory::Resource)
+        {
             if p.exists() {
                 resolved_bin = Some(p);
             }
@@ -425,9 +500,9 @@ pub async fn run_transcription(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        
+
         let mut needs_copy = std::env::var("APPIMAGE").is_ok() || std::env::var("APPDIR").is_ok();
-        
+
         if !needs_copy {
             if let Ok(meta) = std::fs::metadata(&bin_path) {
                 let perms = meta.permissions();
@@ -440,18 +515,20 @@ pub async fn run_transcription(
                 }
             }
         }
-        
+
         if needs_copy {
             if let Ok(cache_dir) = app.path().app_cache_dir() {
                 let cached_bin = cache_dir.join(&bin_name);
                 let _ = std::fs::create_dir_all(&cache_dir);
-                
-                let should_copy = if let (Ok(src_meta), Ok(dst_meta)) = (std::fs::metadata(&bin_path), std::fs::metadata(&cached_bin)) {
+
+                let should_copy = if let (Ok(src_meta), Ok(dst_meta)) =
+                    (std::fs::metadata(&bin_path), std::fs::metadata(&cached_bin))
+                {
                     src_meta.len() != dst_meta.len()
                 } else {
                     true
                 };
-                
+
                 if should_copy && std::fs::copy(&bin_path, &cached_bin).is_ok() {
                     if let Ok(meta) = std::fs::metadata(&cached_bin) {
                         let mut perms = meta.permissions();
@@ -469,7 +546,9 @@ pub async fn run_transcription(
                                 let name_str = name.to_string_lossy();
                                 if name_str.ends_with(".so") || name_str.contains(".so.") {
                                     let dst_file = cache_dir.join(name);
-                                    let copy_so = if let (Ok(s_meta), Ok(d_meta)) = (std::fs::metadata(&src_file), std::fs::metadata(&dst_file)) {
+                                    let copy_so = if let (Ok(s_meta), Ok(d_meta)) =
+                                        (std::fs::metadata(&src_file), std::fs::metadata(&dst_file))
+                                    {
                                         s_meta.len() != d_meta.len()
                                     } else {
                                         true
@@ -482,14 +561,14 @@ pub async fn run_transcription(
                         }
                     }
                 }
-                
+
                 if cached_bin.exists() {
                     bin_path = cached_bin;
                 }
             }
         }
     }
-    
+
     // Resolve output directory based on user settings, multi-disk support, and write-permission safety
     let input_path = Path::new(&settings.input_file);
     let base_name = input_path.file_stem().unwrap_or_default().to_string_lossy();
@@ -497,8 +576,11 @@ pub async fn run_transcription(
 
     let out_dir = resolve_output_dir(&settings, parent_dir);
     let out_name = resolve_non_colliding_output_name(&out_dir, &base_name);
-    let out_name_str = out_name.to_str().ok_or("Invalid output name path")?.to_string();
-    
+    let out_name_str = out_name
+        .to_str()
+        .ok_or("Invalid output name path")?
+        .to_string();
+
     let model_full_path = resolve_model_subpath(root, &settings.model_path);
     if !model_full_path.is_file() {
         return Err(format!(
@@ -530,56 +612,131 @@ pub async fn run_transcription(
         "-of".to_string(),
         out_name_str.clone(),
     ];
-    
+
     if !settings.language.is_empty() && settings.language != "auto" {
         args.push("-l".to_string());
         args.push(settings.language.clone());
     }
-    
+
     if !settings.prompt.is_empty() {
         args.push("--prompt".to_string());
         args.push(settings.prompt.clone());
     }
-    
-    if settings.output_txt { args.push("-otxt".to_string()); }
-    if settings.output_vtt { args.push("-ovtt".to_string()); }
-    if settings.output_srt { args.push("-osrt".to_string()); }
-    if settings.output_lrc { args.push("-olrc".to_string()); }
-    if settings.output_csv { args.push("-ocsv".to_string()); }
-    if settings.output_json { args.push("-oj".to_string()); }
-    if settings.output_json_full { args.push("-ojf".to_string()); }
-    
-    if settings.offset_t > 0 { args.push("-ot".to_string()); args.push(settings.offset_t.to_string()); }
-    if settings.duration > 0 { args.push("-d".to_string()); args.push(settings.duration.to_string()); }
-    if settings.max_context != -1 { args.push("-mc".to_string()); args.push(settings.max_context.to_string()); }
-    if settings.max_len > 0 { args.push("-ml".to_string()); args.push(settings.max_len.to_string()); }
-    if settings.split_word { args.push("-sow".to_string()); }
-    if settings.best_of != 5 { args.push("-bo".to_string()); args.push(settings.best_of.to_string()); }
-    if settings.beam_size != 5 { args.push("-bs".to_string()); args.push(settings.beam_size.to_string()); }
-    if settings.audio_ctx > 0 { args.push("-ac".to_string()); args.push(settings.audio_ctx.to_string()); }
-    
-    if (settings.word_thold - 0.01).abs() > 0.001 { args.push("-wt".to_string()); args.push(format!("{:.2}", settings.word_thold)); }
-    if (settings.entropy_thold - 2.40).abs() > 0.001 { args.push("-et".to_string()); args.push(format!("{:.2}", settings.entropy_thold)); }
-    if (settings.logprob_thold - -1.00).abs() > 0.001 { args.push("-lpt".to_string()); args.push(format!("{:.2}", settings.logprob_thold)); }
-    if (settings.no_speech_thold - 0.60).abs() > 0.001 { args.push("-nth".to_string()); args.push(format!("{:.2}", settings.no_speech_thold)); }
-    if settings.temperature != 0.00 { args.push("-tp".to_string()); args.push(format!("{:.2}", settings.temperature)); }
-    if (settings.temperature_inc - 0.20).abs() > 0.001 { args.push("-tpi".to_string()); args.push(format!("{:.2}", settings.temperature_inc)); }
-    
-    if settings.debug_mode { args.push("-debug".to_string()); }
-    if settings.translate { args.push("-tr".to_string()); }
-    if settings.diarize { args.push("-di".to_string()); }
-    if settings.tiny_diarize { args.push("-tdrz".to_string()); }
-    if settings.no_fallback { args.push("-nf".to_string()); }
-    
-    if settings.no_prints { args.push("-np".to_string()); }
-    if settings.print_colors { args.push("-pc".to_string()); }
+
+    if settings.output_txt {
+        args.push("-otxt".to_string());
+    }
+    if settings.output_vtt {
+        args.push("-ovtt".to_string());
+    }
+    if settings.output_srt {
+        args.push("-osrt".to_string());
+    }
+    if settings.output_lrc {
+        args.push("-olrc".to_string());
+    }
+    if settings.output_csv {
+        args.push("-ocsv".to_string());
+    }
+    if settings.output_json {
+        args.push("-oj".to_string());
+    }
+    if settings.output_json_full {
+        args.push("-ojf".to_string());
+    }
+
+    if settings.offset_t > 0 {
+        args.push("-ot".to_string());
+        args.push(settings.offset_t.to_string());
+    }
+    if settings.duration > 0 {
+        args.push("-d".to_string());
+        args.push(settings.duration.to_string());
+    }
+    if settings.max_context != -1 {
+        args.push("-mc".to_string());
+        args.push(settings.max_context.to_string());
+    }
+    if settings.max_len > 0 {
+        args.push("-ml".to_string());
+        args.push(settings.max_len.to_string());
+    }
+    if settings.split_word {
+        args.push("-sow".to_string());
+    }
+    if settings.best_of != 5 {
+        args.push("-bo".to_string());
+        args.push(settings.best_of.to_string());
+    }
+    if settings.beam_size != 5 {
+        args.push("-bs".to_string());
+        args.push(settings.beam_size.to_string());
+    }
+    if settings.audio_ctx > 0 {
+        args.push("-ac".to_string());
+        args.push(settings.audio_ctx.to_string());
+    }
+
+    if (settings.word_thold - 0.01).abs() > 0.001 {
+        args.push("-wt".to_string());
+        args.push(format!("{:.2}", settings.word_thold));
+    }
+    if (settings.entropy_thold - 2.40).abs() > 0.001 {
+        args.push("-et".to_string());
+        args.push(format!("{:.2}", settings.entropy_thold));
+    }
+    if (settings.logprob_thold - -1.00).abs() > 0.001 {
+        args.push("-lpt".to_string());
+        args.push(format!("{:.2}", settings.logprob_thold));
+    }
+    if (settings.no_speech_thold - 0.60).abs() > 0.001 {
+        args.push("-nth".to_string());
+        args.push(format!("{:.2}", settings.no_speech_thold));
+    }
+    if settings.temperature != 0.00 {
+        args.push("-tp".to_string());
+        args.push(format!("{:.2}", settings.temperature));
+    }
+    if (settings.temperature_inc - 0.20).abs() > 0.001 {
+        args.push("-tpi".to_string());
+        args.push(format!("{:.2}", settings.temperature_inc));
+    }
+
+    if settings.debug_mode {
+        args.push("-debug".to_string());
+    }
+    if settings.translate {
+        args.push("-tr".to_string());
+    }
+    if settings.diarize {
+        args.push("-di".to_string());
+    }
+    if settings.tiny_diarize {
+        args.push("-tdrz".to_string());
+    }
+    if settings.no_fallback {
+        args.push("-nf".to_string());
+    }
+
+    if settings.no_prints {
+        args.push("-np".to_string());
+    }
+    if settings.print_colors {
+        args.push("-pc".to_string());
+    }
     if settings.print_confidence && (settings.output_json || settings.output_json_full) {
         args.push("--print-confidence".to_string());
     }
-    if settings.print_progress { args.push("-pp".to_string()); }
-    if settings.carry_prompt { args.push("--carry-initial-prompt".to_string()); }
-    if settings.log_score { args.push("-ls".to_string()); }
-    
+    if settings.print_progress {
+        args.push("-pp".to_string());
+    }
+    if settings.carry_prompt {
+        args.push("--carry-initial-prompt".to_string());
+    }
+    if settings.log_score {
+        args.push("-ls".to_string());
+    }
+
     if settings.dtw_enabled {
         if let Some(token) = dtw_token_for_model(&settings.model_path) {
             args.push("--dtw".to_string());
@@ -589,15 +746,20 @@ pub async fn run_transcription(
     } else if !settings.flash_attn {
         args.push("-nfa".to_string());
     }
-    
-    if settings.selected_backend == "Standard" { args.push("-ng".to_string()); }
-    if settings.device_id != 0 { args.push("-dev".to_string()); args.push(settings.device_id.to_string()); }
-    
+
+    if settings.selected_backend == "Standard" {
+        args.push("-ng".to_string());
+    }
+    if settings.device_id != 0 {
+        args.push("-dev".to_string());
+        args.push(settings.device_id.to_string());
+    }
+
     if settings.selected_backend == "OpenVINO" && !settings.ov_device.is_empty() {
         args.push("--ov-e-device".to_string());
         args.push(settings.ov_device.clone());
     }
-    
+
     if settings.vad {
         args.push("--vad".to_string());
         let vad_model_name = if !settings.vad_model.is_empty() {
@@ -614,33 +776,53 @@ pub async fn run_transcription(
         }
         args.push("-vm".to_string());
         args.push(vad_full_path.to_string_lossy().to_string());
-        args.push("-vt".to_string()); args.push(format!("{:.2}", settings.vad_thold));
-        args.push("-vspd".to_string()); args.push(settings.vad_min_speech.to_string());
-        args.push("-vsd".to_string()); args.push(settings.vad_min_sil.to_string());
-        args.push("-vmsd".to_string()); args.push(format!("{:.1}", settings.vad_max_speech));
-        args.push("-vp".to_string()); args.push(settings.vad_speech_pad.to_string());
-        args.push("-vo".to_string()); args.push(format!("{:.2}", settings.vad_overlap));
+        args.push("-vt".to_string());
+        args.push(format!("{:.2}", settings.vad_thold));
+        args.push("-vspd".to_string());
+        args.push(settings.vad_min_speech.to_string());
+        args.push("-vsd".to_string());
+        args.push(settings.vad_min_sil.to_string());
+        args.push("-vmsd".to_string());
+        args.push(format!("{:.1}", settings.vad_max_speech));
+        args.push("-vp".to_string());
+        args.push(settings.vad_speech_pad.to_string());
+        args.push("-vo".to_string());
+        args.push(format!("{:.2}", settings.vad_overlap));
     }
-    
+
     // Check cancellation before spawning
     if session.lock().map(|l| l.cancel_requested).unwrap_or(false) {
-        let _ = app.emit("transcribe-status", TranscribeProgress {
-            progress: 0.0,
-            message: "Aborted".to_string(),
-            active: false,
-            stage: Some("aborted".to_string()),
-        });
+        let _ = app.emit(
+            "transcribe-status",
+            TranscribeProgress {
+                progress: 0.0,
+                message: "Aborted".to_string(),
+                active: false,
+                stage: Some("aborted".to_string()),
+            },
+        );
         return Err("Whisper process was cancelled by the user.".to_string());
     }
 
-    logs.log(&app, "Whisper", &format!("Spawning Whisper CLI: {} {}", bin_path.display(), args.join(" ")));
-    let _ = app.emit("transcribe-status", TranscribeProgress {
-        progress: 0.0,
-        message: "Running Whisper AI model...".to_string(),
-        active: true,
-        stage: Some("model_init".to_string()),
-    });
-    
+    logs.log(
+        &app,
+        "Whisper",
+        &format!(
+            "Spawning Whisper CLI: {} {}",
+            bin_path.display(),
+            args.join(" ")
+        ),
+    );
+    let _ = app.emit(
+        "transcribe-status",
+        TranscribeProgress {
+            progress: 0.0,
+            message: "Running Whisper AI model...".to_string(),
+            active: true,
+            stage: Some("model_init".to_string()),
+        },
+    );
+
     let mut cmd = Command::new(&bin_path);
     #[cfg(target_os = "windows")]
     cmd.creation_flags(0x08000000);
@@ -715,7 +897,7 @@ pub async fn run_transcription(
                 format!("Failed to spawn Whisper process ({}): {}", bin_name, e)
             }
         })?;
-        
+
     let pid = child.id();
     let is_cancelled = if let Ok(mut lock) = session.lock() {
         if lock.cancel_requested {
@@ -730,26 +912,38 @@ pub async fn run_transcription(
 
     if is_cancelled {
         let _ = child.kill().await;
-        let _ = app.emit("transcribe-status", TranscribeProgress {
-            progress: 0.0,
-            message: "Aborted".to_string(),
-            active: false,
-            stage: Some("aborted".to_string()),
-        });
+        let _ = app.emit(
+            "transcribe-status",
+            TranscribeProgress {
+                progress: 0.0,
+                message: "Aborted".to_string(),
+                active: false,
+                stage: Some("aborted".to_string()),
+            },
+        );
         return Err("Whisper process was cancelled by the user.".to_string());
     }
-        
-    let stdout = child.stdout.take().ok_or("Failed to capture whisper stdout")?;
-    let stderr = child.stderr.take().ok_or("Failed to capture whisper stderr")?;
-    
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("Failed to capture whisper stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("Failed to capture whisper stderr")?;
+
     let mut stdout_reader = BufReader::new(stdout).lines();
     let mut stderr_reader = BufReader::new(stderr).lines();
-    
+
     // Regex to match timestamps like: [00:01:23.000 --> 00:01:30.000]
-    let timestamp_regex = Regex::new(r"\[(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})\.(\d{3})\]").expect("static regex");
+    let timestamp_regex = Regex::new(
+        r"\[(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})\.(\d{3})\]",
+    )
+    .expect("static regex");
     // Regex to match duration in Whisper startup logs: e.g. "samples, 50.0 sec)"
     let whisper_duration_regex = Regex::new(r"samples,\s*([\d.]+)\s*sec\)").expect("static regex");
-    
+
     let mut stdout_done = false;
     let mut stderr_done = false;
 
@@ -759,23 +953,54 @@ pub async fn run_transcription(
                 match res {
                     Some(l) => {
                         logs.log(&app, "Whisper", &l);
-                        
+
                         // Parse timestamp to calculate progress
                         if let Some(caps) = timestamp_regex.captures(&l) {
                             if let (Some(h_str), Some(m_str), Some(s_str)) = (caps.get(5), caps.get(6), caps.get(7)) {
                                 let h = h_str.as_str().parse::<f64>().unwrap_or(0.0);
                                 let m = m_str.as_str().parse::<f64>().unwrap_or(0.0);
                                 let s = s_str.as_str().parse::<f64>().unwrap_or(0.0);
-                                
-                                let curr_time_secs = h * 3600.0 + m * 60.0 + s;
+
+                                let ms = caps
+                                    .get(8)
+                                    .and_then(|value| value.as_str().parse::<f64>().ok())
+                                    .unwrap_or(0.0);
+
+                                let curr_time_secs =
+                                    h * 3600.0 + m * 60.0 + s + (ms / 1000.0);
+
                                 if duration_sec > 0.0 {
-                                    let progress = (curr_time_secs / duration_sec).clamp(0.0, 1.0);
+                                    let progress =
+                                        (curr_time_secs / duration_sec).clamp(0.0, 1.0);
+
                                     let _ = app.emit("transcribe-status", TranscribeProgress {
                                         progress,
                                         message: format!("Transcribing: {:.0}%", progress * 100.0),
                                         active: true,
                                         stage: Some("transcribing".to_string()),
                                     });
+
+                                    let elapsed_sec = start_time.elapsed().as_secs_f64();
+                                    if elapsed_sec > 0.0 && curr_time_secs > 0.0 {
+                                        let speed_factor = curr_time_secs / elapsed_sec;
+                                        let eta_sec = if speed_factor > 0.0 {
+                                            ((duration_sec - curr_time_secs).max(0.0)
+                                                / speed_factor)
+                                                .max(0.0)
+                                        } else {
+                                            0.0
+                                        };
+
+                                        let _ = app.emit(
+                                            "transcribe-metrics",
+                                            TranscribeMetrics {
+                                                progress,
+                                                elapsed_sec,
+                                                speed_factor,
+                                                eta_sec,
+                                            },
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -800,21 +1025,48 @@ pub async fn run_transcription(
             }
         }
     }
-    
-    let status = child.wait().await.map_err(|e| format!("Whisper CLI wait failed: {}", e))?;
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("Whisper CLI wait failed: {}", e))?;
     let _ = fs::remove_file(&wav_path); // Clean up converted WAV file
-    
+
     if !status.success() {
         // Distinguish a genuine user cancellation from a real failure so the UI
         // never labels an unexpected crash as "Aborted".
         let cancelled = session.lock().map(|l| l.cancel_requested).unwrap_or(false);
         if cancelled {
-            let _ = app.emit("transcribe-status", TranscribeProgress { progress: 0.0, message: "Aborted".to_string(), active: false, stage: Some("aborted".to_string()) });
-            send_notification(&app, "Transcription Cancelled", &format!("Whisper process cancelled for {}!", file_name));
+            let _ = app.emit(
+                "transcribe-status",
+                TranscribeProgress {
+                    progress: 0.0,
+                    message: "Aborted".to_string(),
+                    active: false,
+                    stage: Some("aborted".to_string()),
+                },
+            );
+            send_notification(
+                &app,
+                "Transcription Cancelled",
+                &format!("Whisper process cancelled for {}!", file_name),
+            );
             return Err("Whisper process was cancelled by the user.".to_string());
         } else {
-            let _ = app.emit("transcribe-status", TranscribeProgress { progress: 0.0, message: "Task Failed".to_string(), active: false, stage: Some("failed".to_string()) });
-            send_notification(&app, "Transcription Failed", &format!("Whisper process terminated for {}!", file_name));
+            let _ = app.emit(
+                "transcribe-status",
+                TranscribeProgress {
+                    progress: 0.0,
+                    message: "Task Failed".to_string(),
+                    active: false,
+                    stage: Some("failed".to_string()),
+                },
+            );
+            send_notification(
+                &app,
+                "Transcription Failed",
+                &format!("Whisper process terminated for {}!", file_name),
+            );
 
             let detailed_err = format_cli_exit_error(
                 &settings.selected_backend,
@@ -825,17 +1077,21 @@ pub async fn run_transcription(
             return Err(detailed_err);
         }
     }
-    
+
     let elapsed = start_time.elapsed().as_millis() as u64;
     let speed_factor = if elapsed > 0 {
         (duration_sec * 1000.0) / elapsed as f64
     } else {
         0.0
     };
-    
+
     // Probe output directory for written formats
     let mut generated_files = Vec::new();
-    let out_basename = Path::new(&out_name_str).file_name().unwrap_or_default().to_string_lossy().to_string();
+    let out_basename = Path::new(&out_name_str)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     let formats = [".txt", ".srt", ".vtt", ".lrc", ".csv", ".json"];
     for fmt in formats {
         let path = format!("{}{}", out_name_str, fmt);
@@ -843,7 +1099,7 @@ pub async fn run_transcription(
             generated_files.push(format!("{}{}", out_basename, fmt));
         }
     }
-    
+
     // Post-process the Karaoke video output format .wts if generated
     let wts_path = format!("{}.wts", out_name_str);
     if Path::new(&wts_path).exists() {
@@ -862,20 +1118,36 @@ pub async fn run_transcription(
             generated_files.push(format!("{}.wts.sh", out_basename));
         }
     }
-    
-    logs.log(&app, "Whisper", "Transcription completed successfully!");
-    
-    // Emitting OS notification
-    send_notification(&app, "Transcription Complete", &format!("Successfully processed {}!", file_name));
 
-        
-    let _ = app.emit("transcribe-status", TranscribeProgress {
-        progress: 1.0,
-        message: "Transcription successfully completed!".to_string(),
-        active: false,
-        stage: Some("completed".to_string()),
-    });
-    
+    logs.log(&app, "Whisper", "Transcription completed successfully!");
+
+    // Emitting OS notification
+    send_notification(
+        &app,
+        "Transcription Complete",
+        &format!("Successfully processed {}!", file_name),
+    );
+
+    let _ = app.emit(
+        "transcribe-status",
+        TranscribeProgress {
+            progress: 1.0,
+            message: "Transcription successfully completed!".to_string(),
+            active: false,
+            stage: Some("completed".to_string()),
+        },
+    );
+
+    let _ = app.emit(
+        "transcribe-metrics",
+        TranscribeMetrics {
+            progress: 1.0,
+            elapsed_sec: elapsed as f64 / 1000.0,
+            speed_factor,
+            eta_sec: 0.0,
+        },
+    );
+
     Ok(TranscriptionResult {
         duration_ms: elapsed,
         speed_factor,
@@ -883,7 +1155,6 @@ pub async fn run_transcription(
         output_dir: out_dir.to_string_lossy().to_string(),
     })
 }
-
 
 pub fn read_text_file(file_path: String) -> Result<String, String> {
     let path = Path::new(&file_path);
@@ -920,7 +1191,6 @@ fn dtw_token_for_model(model_path: &str) -> Option<&'static str> {
     }
 }
 
-
 /// Reads one line from a child-process pipe, lossily decoding non-UTF-8 bytes
 /// instead of erroring. A hard UTF-8 error here would abandon the pipe mid-run;
 /// the child keeps writing, the pipe fills, and `child.wait()` deadlocks forever.
@@ -942,7 +1212,14 @@ pub fn is_dir_writable(dir: &Path) -> bool {
     if !dir.exists() || !dir.is_dir() {
         return false;
     }
-    let test_file = dir.join(format!(".whisper_write_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
+    let test_file = dir.join(format!(
+        ".whisper_write_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
     if std::fs::write(&test_file, b"ok").is_ok() {
         let _ = std::fs::remove_file(&test_file);
         true
@@ -993,9 +1270,9 @@ pub fn resolve_non_colliding_output_name(out_dir: &Path, base_name: &str) -> std
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        CHECK_EXTENSIONS.iter().any(|ext| {
-            out_dir.join(format!("{}{}", name_str, ext)).exists()
-        })
+        CHECK_EXTENSIONS
+            .iter()
+            .any(|ext| out_dir.join(format!("{}{}", name_str, ext)).exists())
     } {
         out_name = out_dir.join(format!("{}-{}", base_name, counter));
         counter += 1;
@@ -1062,8 +1339,14 @@ pub fn format_cli_exit_error(
                 bin_name
             )
         }
-        Some(code) => format!("{} ({}) process failed with exit code: {}", backend_display, bin_name, code),
-        None => format!("{} ({}) was terminated unexpectedly by a system signal.", backend_display, bin_name),
+        Some(code) => format!(
+            "{} ({}) process failed with exit code: {}",
+            backend_display, bin_name, code
+        ),
+        None => format!(
+            "{} ({}) was terminated unexpectedly by a system signal.",
+            backend_display, bin_name
+        ),
     }
 }
 
@@ -1074,35 +1357,66 @@ mod tests {
     #[test]
     fn test_format_cli_exit_error_all_cases() {
         // Vulkan missing DLL
-        let err_vulkan_dll = format_cli_exit_error("Vulkan", "whisper-cli-vulkan.exe", "ggml-base.bin", Some(-1073741515));
+        let err_vulkan_dll = format_cli_exit_error(
+            "Vulkan",
+            "whisper-cli-vulkan.exe",
+            "ggml-base.bin",
+            Some(-1073741515),
+        );
         assert!(err_vulkan_dll.contains("Vulkan Runtime Missing"));
         assert!(err_vulkan_dll.contains("vulkan-1.dll"));
 
         // OpenVINO missing DLL
-        let err_ov_dll = format_cli_exit_error("OpenVINO", "whisper-cli-openvino.exe", "ggml-base.bin", Some(-1073741515));
+        let err_ov_dll = format_cli_exit_error(
+            "OpenVINO",
+            "whisper-cli-openvino.exe",
+            "ggml-base.bin",
+            Some(-1073741515),
+        );
         assert!(err_ov_dll.contains("OpenVINO Runtime Missing"));
 
         // CUDA missing DLL
-        let err_cuda_dll = format_cli_exit_error("CUDA", "whisper-cli-cuda.exe", "ggml-base.bin", Some(-1073741515));
+        let err_cuda_dll = format_cli_exit_error(
+            "CUDA",
+            "whisper-cli-cuda.exe",
+            "ggml-base.bin",
+            Some(-1073741515),
+        );
         assert!(err_cuda_dll.contains("CUDA Runtime Missing"));
 
         // CPU illegal instruction (AVX2 incompatibility)
-        let err_cpu_illegal = format_cli_exit_error("Standard", "whisper-cli-standard.exe", "ggml-base.bin", Some(-1073741795));
+        let err_cpu_illegal = format_cli_exit_error(
+            "Standard",
+            "whisper-cli-standard.exe",
+            "ggml-base.bin",
+            Some(-1073741795),
+        );
         assert!(err_cpu_illegal.contains("CPU Instruction Incompatibility"));
         assert!(err_cpu_illegal.contains("AVX2/FMA"));
 
         // Model / GPU init error (exit code 10)
-        let err_code_10 = format_cli_exit_error("Vulkan", "whisper-cli-vulkan.exe", "ggml-base.bin", Some(10));
+        let err_code_10 = format_cli_exit_error(
+            "Vulkan",
+            "whisper-cli-vulkan.exe",
+            "ggml-base.bin",
+            Some(10),
+        );
         assert!(err_code_10.contains("exit code 10"));
 
         // Access violation
-        let err_access_viol = format_cli_exit_error("Standard", "whisper-cli-standard.exe", "ggml-base.bin", Some(-1073741819));
+        let err_access_viol = format_cli_exit_error(
+            "Standard",
+            "whisper-cli-standard.exe",
+            "ggml-base.bin",
+            Some(-1073741819),
+        );
         assert!(err_access_viol.contains("STATUS_ACCESS_VIOLATION"));
     }
 
     #[test]
     fn test_resolve_output_dir_input_dir_mode() {
-        let temp_dir = std::env::temp_dir().join(format!("whisper_test_dir_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("whisper_test_dir_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp_dir);
 
         let mut settings = WhisperSettings::default_settings();
@@ -1116,7 +1430,8 @@ mod tests {
 
     #[test]
     fn test_resolve_output_dir_custom_mode() {
-        let custom_dir = std::env::temp_dir().join(format!("whisper_custom_dir_{}", std::process::id()));
+        let custom_dir =
+            std::env::temp_dir().join(format!("whisper_custom_dir_{}", std::process::id()));
         let input_dir = std::env::temp_dir().join(format!("whisper_in_dir_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&input_dir);
 
@@ -1134,7 +1449,8 @@ mod tests {
 
     #[test]
     fn test_resolve_non_colliding_output_name_all_formats() {
-        let temp_dir = std::env::temp_dir().join(format!("whisper_collide_dir_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("whisper_collide_dir_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp_dir);
 
         // Pre-create a .vtt file (without .srt or .txt)
@@ -1157,7 +1473,7 @@ mod tests {
     #[test]
     fn test_resolve_model_subpath_handles_mixed_separators() {
         let root = Path::new("/tmp/whisper_models");
-        
+
         let path_unix = resolve_model_subpath(root, "models/ggml-base.bin");
         assert_eq!(path_unix, root.join("models").join("ggml-base.bin"));
 
@@ -1165,10 +1481,15 @@ mod tests {
         assert_eq!(path_win, root.join("models").join("ggml-base.bin"));
 
         let path_nested = resolve_model_subpath(root, "sub/dir\\nested/ggml-tiny.bin");
-        assert_eq!(path_nested, root.join("sub").join("dir").join("nested").join("ggml-tiny.bin"));
+        assert_eq!(
+            path_nested,
+            root.join("sub")
+                .join("dir")
+                .join("nested")
+                .join("ggml-tiny.bin")
+        );
 
         let path_traversal = resolve_model_subpath(root, "../../etc/passwd");
         assert_eq!(path_traversal, root.join("etc").join("passwd"));
     }
 }
-

@@ -40,6 +40,8 @@ pub struct QueueJob {
     pub message: Option<String>,
     pub output_files: Vec<String>,
     pub error: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub speed_factor: Option<f64>,
     pub created_at_ms: u64,
 
     #[serde(skip)]
@@ -195,6 +197,8 @@ pub async fn add_job_queue_files(
                 message: Some("Inspecting media".to_string()),
                 output_files: Vec::new(),
                 error: None,
+                duration_ms: None,
+                speed_factor: None,
                 created_at_ms: now_ms(),
                 cancel_requested: false,
             });
@@ -353,10 +357,7 @@ pub async fn cancel_queue_job(
             .find(|job| job.id == job_id)
             .ok_or_else(|| "Queue job not found.".to_string())?;
 
-        let active = matches!(
-            job.status,
-            JobStatus::Converting | JobStatus::Transcribing
-        );
+        let active = matches!(job.status, JobStatus::Converting | JobStatus::Transcribing);
 
         match job.status {
             JobStatus::Inspecting | JobStatus::Ready | JobStatus::Queued => {
@@ -386,9 +387,7 @@ pub async fn cancel_queue_job(
         // the queue still looks active but the shared transcription session has
         // already returned to Idle. In that case the queue-level cancellation
         // flag is enough; start_job_queue checks it before starting Whisper.
-        if let Err(error) =
-            crate::cancel_transcription_session(session_state.0.clone()).await
-        {
+        if let Err(error) = crate::cancel_transcription_session(session_state.0.clone()).await {
             if !error.contains("No active transcription or translation session") {
                 return Err(error);
             }
@@ -495,7 +494,7 @@ pub async fn start_job_queue(
             session.clone(),
             source_path.clone(),
         )
-            .await
+        .await
         {
             Ok(path) => path,
 
@@ -534,9 +533,7 @@ pub async fn start_job_queue(
                 .lock()
                 .map_err(|error| format!("Queue lock error: {error}"))?;
 
-            let cancelled = if let Some(job) =
-                queue.jobs.iter_mut().find(|job| job.id == job_id)
-            {
+            let cancelled = if let Some(job) = queue.jobs.iter_mut().find(|job| job.id == job_id) {
                 if job.cancel_requested {
                     job.status = JobStatus::Cancelled;
                     job.progress = 0.0;
@@ -579,7 +576,7 @@ pub async fn start_job_queue(
             wav_path,
             duration_sec,
         )
-            .await
+        .await
         {
             Ok(result) => {
                 let mut queue = queue_state
@@ -595,6 +592,8 @@ pub async fn start_job_queue(
                     ));
                     job.output_files = result.generated_files;
                     job.error = None;
+                    job.duration_ms = Some(result.duration_ms);
+                    job.speed_factor = Some(result.speed_factor);
                     job.cancel_requested = false;
                 }
 
