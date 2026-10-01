@@ -74,6 +74,77 @@ type HistoryEntry = {
   error: string | null;
 };
 
+type ModelScanResult = {
+  transModels: string[];
+  vadModels: string[];
+};
+
+type ModelDownloadProgress = {
+  modelName: string;
+  phase:
+    | "starting"
+    | "downloading"
+    | "paused"
+    | "completed"
+    | "failed";
+  progress: number;
+  downloadedBytes: number;
+  totalBytes: number;
+  speedBps: number;
+  error: string | null;
+};
+
+type ModelInfo = {
+  name: string;
+  label: string;
+  size: string;
+  note: string;
+};
+
+const MODEL_CATALOG: ModelInfo[] = [
+  { name: "tiny", label: "Tiny", size: "77 MB", note: "Fastest multilingual test model" },
+  { name: "tiny-q5_1", label: "Tiny Q5", size: "32 MB", note: "Very small quantized model" },
+  { name: "tiny-q8_0", label: "Tiny Q8", size: "44 MB", note: "Small quantized model" },
+  { name: "tiny.en", label: "Tiny English", size: "78 MB", note: "English-only test model" },
+  { name: "tiny.en-q5_1", label: "Tiny English Q5", size: "32 MB", note: "English-only quantized" },
+  { name: "tiny.en-q8_0", label: "Tiny English Q8", size: "44 MB", note: "English-only quantized" },
+
+  { name: "base", label: "Base", size: "148 MB", note: "Light multilingual model" },
+  { name: "base-q5_1", label: "Base Q5", size: "60 MB", note: "Light quantized model" },
+  { name: "base-q8_0", label: "Base Q8", size: "82 MB", note: "Light quantized model" },
+  { name: "base.en", label: "Base English", size: "148 MB", note: "English-only" },
+  { name: "base.en-q5_1", label: "Base English Q5", size: "60 MB", note: "English-only quantized" },
+  { name: "base.en-q8_0", label: "Base English Q8", size: "82 MB", note: "English-only quantized" },
+
+  { name: "small", label: "Small", size: "488 MB", note: "Good speed/quality balance" },
+  { name: "small-q5_1", label: "Small Q5", size: "190 MB", note: "Efficient quantized model" },
+  { name: "small-q8_0", label: "Small Q8", size: "264 MB", note: "Higher-quality quantized model" },
+  { name: "small.en", label: "Small English", size: "488 MB", note: "English-only" },
+  { name: "small.en-q5_1", label: "Small English Q5", size: "190 MB", note: "English-only quantized" },
+  { name: "small.en-q8_0", label: "Small English Q8", size: "264 MB", note: "English-only quantized" },
+  { name: "small.en-tdrz", label: "Small English TDRZ", size: "488 MB", note: "TinyDiarize-compatible English model" },
+
+  { name: "medium", label: "Medium", size: "1.53 GB", note: "High multilingual quality" },
+  { name: "medium-q5_0", label: "Medium Q5", size: "539 MB", note: "Efficient high-quality model" },
+  { name: "medium-q8_0", label: "Medium Q8", size: "823 MB", note: "High-quality quantized model" },
+  { name: "medium.en", label: "Medium English", size: "1.53 GB", note: "High-quality English-only" },
+  { name: "medium.en-q5_0", label: "Medium English Q5", size: "539 MB", note: "English-only quantized" },
+  { name: "medium.en-q8_0", label: "Medium English Q8", size: "823 MB", note: "English-only quantized" },
+
+  { name: "large-v1", label: "Large v1", size: "3.09 GB", note: "Legacy large model" },
+  { name: "large-v2", label: "Large v2", size: "3.09 GB", note: "Legacy large model" },
+  { name: "large-v2-q5_0", label: "Large v2 Q5", size: "1.08 GB", note: "Quantized large v2" },
+  { name: "large-v2-q8_0", label: "Large v2 Q8", size: "1.66 GB", note: "Quantized large v2" },
+
+  { name: "large-v3", label: "Large v3", size: "3.10 GB", note: "Maximum transcription quality" },
+  { name: "large-v3-q5_0", label: "Large v3 Q5", size: "1.08 GB", note: "Efficient large-v3" },
+  { name: "large-v3-turbo", label: "Large v3 Turbo", size: "1.62 GB", note: "Recommended: excellent quality + speed" },
+  { name: "large-v3-turbo-q5_0", label: "Large v3 Turbo Q5", size: "574 MB", note: "Fast, compact turbo model" },
+  { name: "large-v3-turbo-q8_0", label: "Large v3 Turbo Q8", size: "874 MB", note: "High-quality compact turbo model" },
+];
+
+const DEFAULT_MODEL = "large-v3-turbo";
+
 type WhisperSettings = Record<string, any>;
 
 let settings: WhisperSettings | null = null;
@@ -89,6 +160,9 @@ let activeProgress = 0;
 let activeMessage = "";
 let activeMetrics: TranscribeMetrics | null = null;
 let activeView: "convert" | "history" = "convert";
+let selectedModel = DEFAULT_MODEL;
+let installedModels = new Set<string>();
+let modelDownload: ModelDownloadProgress | null = null;
 
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   <main>
@@ -111,6 +185,42 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
     </div>
 
     <section id="convert-view">
+      <div id="model-panel" style="
+        padding:16px;
+        border:1px solid #444;
+        border-radius:8px;
+        background:#242424;
+        margin-bottom:18px;
+      ">
+        <div style="
+          display:flex;
+          align-items:flex-end;
+          gap:12px;
+          flex-wrap:wrap;
+        ">
+          <label style="display:flex; flex-direction:column; gap:6px; min-width:300px;">
+            <span style="font-size:0.9rem; color:#b8b8b8;">Transcription model</span>
+            <select id="model-select" style="
+              font:inherit;
+              padding:10px 12px;
+              border-radius:8px;
+              border:1px solid #454545;
+              background:#171717;
+              color:inherit;
+            "></select>
+          </label>
+
+          <button id="download-model">Download Model</button>
+        </div>
+
+        <div id="model-status" style="
+          margin-top:10px;
+          color:#b8b8b8;
+          font-size:0.9rem;
+          line-height:1.5;
+        "></div>
+      </div>
+
       <div style="
         display:flex;
         gap:12px;
@@ -170,6 +280,13 @@ const startButton =
 const clearQueueButton =
   document.querySelector<HTMLButtonElement>("#clear-queue")!;
 
+const modelSelect =
+  document.querySelector<HTMLSelectElement>("#model-select")!;
+const downloadModelButton =
+  document.querySelector<HTMLButtonElement>("#download-model")!;
+const modelStatus =
+  document.querySelector<HTMLDivElement>("#model-status")!;
+
 const refreshHistoryButton =
   document.querySelector<HTMLButtonElement>("#refresh-history")!;
 const clearHistoryButton =
@@ -221,6 +338,152 @@ function formatDate(value: number | null): string {
   }
 
   return new Date(value).toLocaleString();
+}
+
+function normalizeModelName(value: string): string {
+  let name = value.trim().toLowerCase().replace(/\\/g, "/").split("/").pop() ?? value;
+
+  if (name.startsWith("ggml-")) {
+    name = name.slice(5);
+  }
+
+  if (name.endsWith(".bin")) {
+    name = name.slice(0, -4);
+  }
+
+  return name;
+}
+
+function modelFileName(name: string): string {
+  return `ggml-${name}.bin`;
+}
+
+function selectedModelInfo(): ModelInfo {
+  return (
+    MODEL_CATALOG.find((model) => model.name === selectedModel) ??
+    MODEL_CATALOG.find((model) => model.name === DEFAULT_MODEL)!
+  );
+}
+
+function renderModelOptions() {
+  modelSelect.innerHTML = MODEL_CATALOG.map((model) => {
+    const recommended =
+      model.name === DEFAULT_MODEL ? " — Recommended" : "";
+
+    return `
+      <option value="${escapeHtml(model.name)}">
+        ${escapeHtml(model.label)} • ${escapeHtml(model.size)}${recommended}
+      </option>
+    `;
+  }).join("");
+
+  modelSelect.value = selectedModel;
+}
+
+function renderModelStatus() {
+  const info = selectedModelInfo();
+  const installed = installedModels.has(selectedModel);
+  const downloading =
+    modelDownload?.modelName === selectedModel &&
+    (modelDownload.phase === "starting" ||
+      modelDownload.phase === "downloading" ||
+      modelDownload.phase === "paused");
+
+  if (downloading && modelDownload) {
+    const percent = Math.round(modelDownload.progress * 100);
+    const downloadedMb =
+      (modelDownload.downloadedBytes / 1024 / 1024).toFixed(0);
+    const totalMb =
+      modelDownload.totalBytes > 0
+        ? (modelDownload.totalBytes / 1024 / 1024).toFixed(0)
+        : "?";
+    const speedMbps =
+      modelDownload.speedBps > 0
+        ? ((modelDownload.speedBps * 8) / 1_000_000).toFixed(1)
+        : "…";
+
+    modelStatus.innerHTML = `
+      <strong>${escapeHtml(info.label)}</strong>
+      • ${escapeHtml(info.size)}
+      • Downloading ${percent}% (${downloadedMb}/${totalMb} MB, ${speedMbps} Mbps)
+    `;
+
+    downloadModelButton.textContent = "Downloading…";
+    downloadModelButton.disabled = true;
+    modelSelect.disabled = true;
+    return;
+  }
+
+  if (
+    modelDownload?.modelName === selectedModel &&
+    modelDownload.phase === "failed"
+  ) {
+    modelStatus.innerHTML = `
+      <strong>${escapeHtml(info.label)}</strong>
+      • ${escapeHtml(info.size)}
+      • Download failed: ${escapeHtml(modelDownload.error ?? "Unknown error")}
+    `;
+
+    downloadModelButton.textContent = "Retry Download";
+    downloadModelButton.disabled = false;
+    modelSelect.disabled = false;
+    return;
+  }
+
+  modelSelect.disabled = queue.running;
+
+  if (installed) {
+    modelStatus.innerHTML = `
+      <strong>${escapeHtml(info.label)}</strong>
+      • ${escapeHtml(info.size)}
+      • Installed
+      ${selectedModel === DEFAULT_MODEL ? " • Recommended for this RTX 4090 test" : ""}
+      <br>${escapeHtml(info.note)}
+    `;
+
+    downloadModelButton.textContent = "Installed";
+    downloadModelButton.disabled = true;
+  } else {
+    modelStatus.innerHTML = `
+      <strong>${escapeHtml(info.label)}</strong>
+      • ${escapeHtml(info.size)}
+      • Not installed
+      ${selectedModel === DEFAULT_MODEL ? " • Recommended for this RTX 4090 test" : ""}
+      <br>${escapeHtml(info.note)}
+    `;
+
+    downloadModelButton.textContent = "Download Model";
+    downloadModelButton.disabled = queue.running;
+  }
+}
+
+async function refreshInstalledModels() {
+  if (!settings) return;
+
+  const scan = await invoke<ModelScanResult>(
+    "scan_models",
+    {
+      modelsDir: settings.modelsDir,
+      backend: "CUDA",
+    },
+  );
+
+  installedModels = new Set(
+    scan.transModels.map(normalizeModelName),
+  );
+
+  renderModelStatus();
+}
+
+async function applySelectedModel() {
+  if (!settings) return;
+
+  settings.selectedBackend = "CUDA";
+  settings.modelPath = modelFileName(selectedModel);
+
+  await invoke("save_settings", { settings });
+  renderModelStatus();
+  renderQueue();
 }
 
 function statusLabel(status: string): string {
@@ -625,11 +888,16 @@ function renderQueue() {
       job.status === "queued",
   );
 
+  const selectedInstalled =
+    installedModels.has(selectedModel);
+
   startButton.disabled =
-    queue.running || !hasRunnableJobs;
+    queue.running || !hasRunnableJobs || !selectedInstalled;
 
   addButton.disabled = queue.running;
   clearQueueButton.disabled = queue.running;
+
+  renderModelStatus();
 }
 
 function renderHistory() {
@@ -859,10 +1127,21 @@ async function initialize() {
       "load_settings",
     );
 
-  // Keep our known-good CUDA regression configuration
-  // while these backend systems are still being verified.
+  // Keep CUDA as the verification backend, but move away from tiny.en.
+  // If the user already selected a real model, preserve it. Otherwise default
+  // this stage to large-v3-turbo.
+  const savedModel = normalizeModelName(
+    String(settings.modelPath ?? ""),
+  );
+
+  selectedModel =
+    MODEL_CATALOG.some((model) => model.name === savedModel) &&
+    savedModel !== "tiny.en"
+      ? savedModel
+      : DEFAULT_MODEL;
+
   settings.selectedBackend = "CUDA";
-  settings.modelPath = "ggml-tiny.en.bin";
+  settings.modelPath = modelFileName(selectedModel);
   settings.outputTxt = true;
   settings.outputSrt = false;
   settings.outputVtt = false;
@@ -882,9 +1161,25 @@ async function initialize() {
     { settings },
   );
 
+  renderModelOptions();
+  await refreshInstalledModels();
   await refreshQueue();
   renderHistory();
 }
+
+await listen<ModelDownloadProgress>(
+  "model-download-status",
+  async (event) => {
+    modelDownload = event.payload;
+
+    if (event.payload.phase === "completed") {
+      await refreshInstalledModels();
+      modelDownload = null;
+    }
+
+    renderModelStatus();
+  },
+);
 
 await listen<QueueSnapshot>(
   "job-queue-updated",
@@ -940,6 +1235,58 @@ historyNav.addEventListener(
   "click",
   () => {
     void showView("history");
+  },
+);
+
+modelSelect.addEventListener(
+  "change",
+  async () => {
+    selectedModel = modelSelect.value;
+    modelDownload = null;
+    await applySelectedModel();
+  },
+);
+
+downloadModelButton.addEventListener(
+  "click",
+  async () => {
+    if (!settings || installedModels.has(selectedModel)) {
+      return;
+    }
+
+    try {
+      modelDownload = {
+        modelName: selectedModel,
+        phase: "starting",
+        progress: 0,
+        downloadedBytes: 0,
+        totalBytes: 0,
+        speedBps: 0,
+        error: null,
+      };
+
+      renderModelStatus();
+
+      await invoke(
+        "start_download_model_task",
+        {
+          modelsDir: settings.modelsDir,
+          modelName: selectedModel,
+        },
+      );
+    } catch (error) {
+      modelDownload = {
+        modelName: selectedModel,
+        phase: "failed",
+        progress: 0,
+        downloadedBytes: 0,
+        totalBytes: 0,
+        speedBps: 0,
+        error: String(error),
+      };
+
+      renderModelStatus();
+    }
   },
 );
 

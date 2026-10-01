@@ -12,6 +12,7 @@ mod job_queue;
 mod media_preview;
 mod output;
 mod settings;
+mod subtitle;
 mod transcribe;
 mod translation;
 mod video_server;

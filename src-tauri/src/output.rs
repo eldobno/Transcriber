@@ -24,41 +24,44 @@ pub fn prepare_job_settings(base: &WhisperSettings, source_path: &str) -> Whispe
 
     // Transcriber's V1 output policy:
     // - audio -> TXT
-    // - video -> SRT internally, then embed that subtitle track in a new MKV
+    // - video -> whisper.cpp full JSON with token timestamps, then Transcriber
+    //   constructs movie-style cues and embeds them in a new MKV.
     if is_video_file(source_path) {
         settings.output_txt = false;
-        settings.output_srt = true;
+        settings.output_srt = false;
+        settings.output_json = false;
+        settings.output_json_full = true;
 
-        // Subtitle-oriented segmentation.
-        //
-        // Whisper's default segmentation can keep a complete spoken sentence in
-        // one long SRT cue. For video playback that feels unlike normal
-        // subtitles: too much text remains on screen for too long.
-        //
-        // `max_len` is measured in characters by whisper.cpp. Combined with
-        // `split_word`, this encourages short, word-boundary subtitle cues while
-        // preserving Whisper's token timestamps. Around 32 characters normally
-        // lands in the 4-7 word range for English and is short enough to avoid
-        // the large two-line blocks we do not want as Transcriber's default.
-        settings.max_len = 32;
-        settings.split_word = true;
+        // We need token-level timestamps for our subtitle engine.
+        settings.dtw_enabled = true;
+
+        // IMPORTANT: whisper.cpp's current CLI JSON writer still exposes
+        // VAD-compressed token times when --vad and -ojf are combined. Segment
+        // times are mapped back but token times are not, causing growing drift.
+        // Keep VAD off specifically for the word-timestamp subtitle pass until
+        // upstream's CLI JSON path uses the VAD-aware token timestamp accessors.
+        settings.vad = false;
+
+        // Cue segmentation is ours now, not whisper.cpp's.
+        settings.max_len = 0;
+        settings.split_word = false;
     } else {
         settings.output_txt = true;
         settings.output_srt = false;
+        settings.output_json = false;
+        settings.output_json_full = false;
     }
 
     settings.output_vtt = false;
     settings.output_lrc = false;
     settings.output_csv = false;
-    settings.output_json = false;
-    settings.output_json_full = false;
 
     settings
 }
 
 pub fn finalizing_message(source_path: &str) -> &'static str {
     if is_video_file(source_path) {
-        "Embedding selectable subtitle track"
+        "Building and embedding timed subtitles"
     } else {
         "Finalizing transcript"
     }
@@ -132,23 +135,46 @@ async fn finalize_video(
 ) -> Result<Vec<String>, String> {
     let output_dir = PathBuf::from(output_dir);
 
-    let Some(srt_name) = generated_files
+    let Some(json_name) = generated_files
         .iter()
-        .find(|file| file.to_ascii_lowercase().ends_with(".srt"))
+        .find(|file| file.to_ascii_lowercase().ends_with(".json"))
     else {
         return Err(
-            "Video transcription completed, but no SRT subtitle file was generated.".to_string(),
+            "Video transcription completed, but no full Whisper JSON timing file was generated."
+                .to_string(),
         );
     };
 
-    let srt_path = output_dir.join(srt_name);
+    let json_path = output_dir.join(json_name);
 
-    if !srt_path.is_file() {
+    if !json_path.is_file() {
         return Err(format!(
-            "Generated subtitle file was not found: {}",
-            srt_path.display()
+            "Generated Whisper timing file was not found: {}",
+            json_path.display()
         ));
     }
+
+    let source_stem = Path::new(source_path)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+
+    let srt_path = unique_path(&output_dir, &format!("{} subtitles", source_stem), "srt");
+
+    let timeline_offset_ms = probe_audio_timeline_offset_ms(&app, source_path)
+        .await
+        .unwrap_or(0);
+
+    let cue_count =
+        crate::subtitle::write_srt_from_whisper_json(&json_path, &srt_path, timeline_offset_ms)?;
+
+    logs.log(
+        &app,
+        "Subtitles",
+        &format!(
+            "Built {cue_count} movie-style subtitle cues with media offset {timeline_offset_ms} ms"
+        ),
+    );
 
     let source = PathBuf::from(source_path);
     if !source.is_file() {
@@ -157,8 +183,6 @@ async fn finalize_video(
             source.display()
         ));
     }
-
-    let source_stem = source.file_stem().unwrap_or_default().to_string_lossy();
 
     // MKV is intentionally the default soft-subtitle container. It lets us
     // stream-copy the original video/audio/subtitle streams and add SRT without
@@ -273,14 +297,18 @@ async fn finalize_video(
     }
 
     // External SRT is an optional future Output setting. For the V1 default,
-    // the generated SRT is an intermediate artifact and the new MKV is the
-    // user-facing result.
-    if let Err(error) = std::fs::remove_file(&srt_path) {
-        logs.log(
-            &app,
-            "Output",
-            &format!("Subtitled video was created, but temporary SRT cleanup failed: {error}"),
-        );
+    // the timing JSON and generated SRT are intermediate artifacts.
+    for temporary in [&json_path, &srt_path] {
+        if let Err(error) = std::fs::remove_file(temporary) {
+            logs.log(
+                &app,
+                "Output",
+                &format!(
+                    "Subtitled video was created, but temporary file cleanup failed for '{}': {error}",
+                    temporary.display()
+                ),
+            );
+        }
     }
 
     logs.log(
@@ -290,6 +318,82 @@ async fn finalize_video(
     );
 
     Ok(vec![file_name_string(&destination)?])
+}
+
+async fn probe_audio_timeline_offset_ms(app: &AppHandle, source_path: &str) -> Result<i64, String> {
+    let ffprobe = crate::ffmpeg_resolver::ensure_ffprobe_available(Some(app))?;
+
+    let mut command = tokio::process::Command::new(ffprobe);
+
+    command
+        .arg("-v")
+        .arg("error")
+        .arg("-show_entries")
+        .arg("stream=codec_type,start_time")
+        .arg("-of")
+        .arg("json")
+        .arg(source_path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        command.creation_flags(0x08000000);
+    }
+
+    let output = command
+        .output()
+        .await
+        .map_err(|error| format!("Failed to inspect source media timestamps: {error}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "ffprobe could not inspect media timestamps: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Invalid ffprobe timestamp JSON: {error}"))?;
+
+    let streams = document
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "ffprobe returned no streams.".to_string())?;
+
+    let mut earliest_start: Option<f64> = None;
+    let mut audio_start: Option<f64> = None;
+
+    for stream in streams {
+        let Some(start) = stream
+            .get("start_time")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<f64>().ok())
+        else {
+            continue;
+        };
+
+        earliest_start = Some(
+            earliest_start
+                .map(|current| current.min(start))
+                .unwrap_or(start),
+        );
+
+        if audio_start.is_none()
+            && stream.get("codec_type").and_then(serde_json::Value::as_str) == Some("audio")
+        {
+            audio_start = Some(start);
+        }
+    }
+
+    let Some(audio_start) = audio_start else {
+        return Ok(0);
+    };
+
+    let earliest_start = earliest_start.unwrap_or(audio_start);
+
+    Ok(((audio_start - earliest_start) * 1000.0).round() as i64)
 }
 
 fn reset_session(session: &Arc<Mutex<TranscriptionSession>>) {
