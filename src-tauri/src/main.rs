@@ -4,4 +4,3 @@
 fn main() {
     transcriber_lib::run()
 }
-

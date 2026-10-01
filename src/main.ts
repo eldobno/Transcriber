@@ -1,22 +1,48 @@
 import { invoke } from "@tauri-apps/api/core";
+import "./styles.css";
 
-let greetInputEl: HTMLInputElement | null;
-let greetMsgEl: HTMLElement | null;
+type HardwareInfo = {
+  os: string;
+  architecture: string;
 
-async function greet() {
-  if (greetMsgEl && greetInputEl) {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    greetMsgEl.textContent = await invoke("greet", {
-      name: greetInputEl.value,
-    });
+  nvidia_available: boolean;
+  gpu_name: string | null;
+  driver_version: string | null;
+  cuda_version: string | null;
+
+  ffmpeg_available: boolean;
+  ffmpeg_version: string | null;
+};
+
+async function loadHardwareInfo() {
+  const output = document.querySelector<HTMLPreElement>("#output");
+
+  if (!output) return;
+
+  output.textContent = "Detecting hardware...";
+
+  try {
+    const info = await invoke<HardwareInfo>("get_hardware_info");
+
+    output.textContent = JSON.stringify(info, null, 2);
+  } catch (error) {
+    output.textContent = `Hardware detection failed:\n${String(error)}`;
   }
 }
 
-window.addEventListener("DOMContentLoaded", () => {
-  greetInputEl = document.querySelector("#greet-input");
-  greetMsgEl = document.querySelector("#greet-msg");
-  document.querySelector("#greet-form")?.addEventListener("submit", (e) => {
-    e.preventDefault();
-    greet();
-  });
-});
+document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
+  <main>
+    <h1>Transcriber</h1>
+    <p>Backend diagnostics</p>
+
+    <button id="detect-button">
+      Detect Hardware
+    </button>
+
+    <pre id="output">Ready.</pre>
+  </main>
+`;
+
+document
+    .querySelector<HTMLButtonElement>("#detect-button")
+    ?.addEventListener("click", loadHardwareInfo);
