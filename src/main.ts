@@ -8,6 +8,7 @@ type JobStatus =
   | "queued"
   | "converting"
   | "transcribing"
+  | "finalizing"
   | "completed"
   | "failed"
   | "cancelled";
@@ -234,6 +235,8 @@ function statusLabel(status: string): string {
       return "Converting";
     case "transcribing":
       return "Transcribing";
+    case "finalizing":
+      return "Finalizing";
     case "completed":
       return "Completed";
     case "failed":
@@ -260,7 +263,8 @@ function isPending(job: QueueJob): boolean {
 function isActive(job: QueueJob): boolean {
   return (
     job.status === "converting" ||
-    job.status === "transcribing"
+    job.status === "transcribing" ||
+    job.status === "finalizing"
   );
 }
 
@@ -436,7 +440,7 @@ function renderQueue() {
             : "";
 
         const detailMessage =
-          activeMessage && active
+          activeMessage && job.status === "transcribing"
             ? activeMessage
             : job.message ?? "";
 

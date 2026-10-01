@@ -21,6 +21,7 @@ pub enum JobStatus {
     Queued,
     Converting,
     Transcribing,
+    Finalizing,
     Completed,
     Failed,
     Cancelled,
@@ -329,7 +330,10 @@ pub fn move_queue_job(
 
     let status = queue.jobs[old_index].status.clone();
 
-    if matches!(status, JobStatus::Converting | JobStatus::Transcribing) {
+    if matches!(
+        status,
+        JobStatus::Converting | JobStatus::Transcribing | JobStatus::Finalizing
+    ) {
         return Err("The active job cannot be reordered.".to_string());
     }
 
@@ -361,7 +365,7 @@ pub fn remove_queue_job(
 
     if matches!(
         queue.jobs[index].status,
-        JobStatus::Converting | JobStatus::Transcribing
+        JobStatus::Converting | JobStatus::Transcribing | JobStatus::Finalizing
     ) {
         return Err("The active job cannot be removed.".to_string());
     }
@@ -383,9 +387,12 @@ pub fn clear_job_queue(
         .lock()
         .map_err(|error| format!("Queue lock error: {error}"))?;
 
-    queue
-        .jobs
-        .retain(|job| matches!(job.status, JobStatus::Converting | JobStatus::Transcribing));
+    queue.jobs.retain(|job| {
+        matches!(
+            job.status,
+            JobStatus::Converting | JobStatus::Transcribing | JobStatus::Finalizing
+        )
+    });
 
     emit_queue(&app, &queue);
 
@@ -413,7 +420,10 @@ pub async fn cancel_queue_job(
             .find(|job| job.id == job_id)
             .ok_or_else(|| "Queue job not found.".to_string())?;
 
-        let active = matches!(job.status, JobStatus::Converting | JobStatus::Transcribing);
+        let active = matches!(
+            job.status,
+            JobStatus::Converting | JobStatus::Transcribing | JobStatus::Finalizing
+        );
 
         let mut terminal_job = None;
 
@@ -428,7 +438,7 @@ pub async fn cancel_queue_job(
                 terminal_job = Some(job.clone());
             }
 
-            JobStatus::Converting | JobStatus::Transcribing => {
+            JobStatus::Converting | JobStatus::Transcribing | JobStatus::Finalizing => {
                 job.cancel_requested = true;
                 job.message = Some("Cancelling...".to_string());
             }
@@ -557,7 +567,10 @@ pub async fn start_job_queue(
 
         let (job_id, source_path, duration_sec, started_job) = next_job;
 
-        if let Err(error) = history_state.record_started(&history_context(&started_job, &settings))
+        let job_settings = crate::output::prepare_job_settings(&settings, &source_path);
+
+        if let Err(error) =
+            history_state.record_started(&history_context(&started_job, &job_settings))
         {
             logs.log(&app, "History", &error);
         }
@@ -603,7 +616,7 @@ pub async fn start_job_queue(
                 emit_queue(&app, &queue);
 
                 if let Some(job) = terminal_job {
-                    record_history_finished(&app, &logs, &history_state, &job, &settings);
+                    record_history_finished(&app, &logs, &history_state, &job, &job_settings);
                 }
 
                 continue;
@@ -651,16 +664,14 @@ pub async fn start_job_queue(
                 .map_err(|error| format!("Queue lock error: {error}"))?;
 
             if let Some(job) = queue.jobs.iter().find(|job| job.id == job_id) {
-                record_history_finished(&app, &logs, &history_state, job, &settings);
+                record_history_finished(&app, &logs, &history_state, job, &job_settings);
             }
 
             continue;
         }
 
-        // Every queued file gets the selected global transcription
-        // settings, but its own input path.
-        let mut job_settings = settings.clone();
-        job_settings.input_file = source_path;
+        // Every queued file uses Transcriber's output policy while
+        // preserving the selected model/backend and transcription options.
 
         // ----------------------------------------------------
         // Existing Whisper Desktop whisper.cpp pipeline
@@ -670,39 +681,82 @@ pub async fn start_job_queue(
             app.clone(),
             logs.clone(),
             session.clone(),
-            job_settings,
+            job_settings.clone(),
             wav_path,
             duration_sec,
         )
         .await
         {
             Ok(result) => {
+                {
+                    let mut queue = queue_state
+                        .lock()
+                        .map_err(|error| format!("Queue lock error: {error}"))?;
+
+                    if let Some(job) = queue.jobs.iter_mut().find(|job| job.id == job_id) {
+                        job.status = JobStatus::Finalizing;
+                        job.progress = 1.0;
+                        job.message =
+                            Some(crate::output::finalizing_message(&source_path).to_string());
+                        job.error = None;
+                    }
+
+                    emit_queue(&app, &queue);
+                }
+
+                let final_outputs = crate::output::finalize_transcription_outputs(
+                    app.clone(),
+                    logs.clone(),
+                    session.clone(),
+                    &source_path,
+                    &result.output_dir,
+                    &result.generated_files,
+                )
+                .await;
+
                 let mut queue = queue_state
                     .lock()
                     .map_err(|error| format!("Queue lock error: {error}"))?;
 
                 if let Some(job) = queue.jobs.iter_mut().find(|job| job.id == job_id) {
-                    job.status = JobStatus::Completed;
-                    job.progress = 1.0;
-                    job.message = Some(format!(
-                        "Completed in {:.2}s",
-                        result.duration_ms as f64 / 1000.0
-                    ));
-                    job.output_files = result.generated_files;
-                    job.error = None;
-                    job.duration_ms = Some(result.duration_ms);
-                    job.speed_factor = Some(result.speed_factor);
-                    job.cancel_requested = false;
+                    match final_outputs {
+                        Ok(output_files) => {
+                            job.status = JobStatus::Completed;
+                            job.progress = 1.0;
+                            job.message = Some(format!(
+                                "Completed in {:.2}s",
+                                result.duration_ms as f64 / 1000.0
+                            ));
+                            job.output_files = output_files;
+                            job.error = None;
+                            job.duration_ms = Some(result.duration_ms);
+                            job.speed_factor = Some(result.speed_factor);
+                            job.cancel_requested = false;
+                        }
+
+                        Err(error) => {
+                            if job.cancel_requested || looks_cancelled(&error) {
+                                job.status = JobStatus::Cancelled;
+                                job.progress = 0.0;
+                                job.message = Some("Cancelled".to_string());
+                                job.error = None;
+                            } else {
+                                job.status = JobStatus::Failed;
+                                job.message = Some("Output finalization failed".to_string());
+                                job.error = Some(error);
+                            }
+                        }
+                    }
+
                     job.completed_at_ms = Some(now_ms());
                 }
 
                 emit_queue(&app, &queue);
 
                 if let Some(job) = queue.jobs.iter().find(|job| job.id == job_id) {
-                    record_history_finished(&app, &logs, &history_state, job, &settings);
+                    record_history_finished(&app, &logs, &history_state, job, &job_settings);
                 }
             }
-
             Err(error) => {
                 let mut queue = queue_state
                     .lock()
@@ -727,7 +781,7 @@ pub async fn start_job_queue(
                 emit_queue(&app, &queue);
 
                 if let Some(job) = queue.jobs.iter().find(|job| job.id == job_id) {
-                    record_history_finished(&app, &logs, &history_state, job, &settings);
+                    record_history_finished(&app, &logs, &history_state, job, &job_settings);
                 }
             }
         }

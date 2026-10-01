@@ -10,6 +10,7 @@ mod history;
 mod logger;
 mod job_queue;
 mod media_preview;
+mod output;
 mod settings;
 mod transcribe;
 mod translation;
@@ -49,6 +50,7 @@ pub enum SessionPhase {
     Idle,
     Transcribing,
     Translating,
+    Finalizing,
 }
 
 pub struct TranscriptionSession {
@@ -422,8 +424,8 @@ async fn scan_models(models_dir: String, backend: String) -> Result<ModelScanRes
             vad_models,
         }
     })
-        .await
-        .map_err(|e| format!("model scan failed: {}", e))
+    .await
+    .map_err(|e| format!("model scan failed: {}", e))
 }
 
 use tauri_plugin_dialog::DialogExt;
@@ -583,8 +585,8 @@ async fn verify_directory_writable(dir_path: String) -> Result<(), String> {
         let _ = std::fs::remove_file(&test_file);
         Ok(())
     })
-        .await
-        .map_err(|e| format!("Directory check failed: {e}"))?
+    .await
+    .map_err(|e| format!("Directory check failed: {e}"))?
 }
 
 #[tauri::command]
@@ -669,9 +671,9 @@ pub(crate) fn ensure_directory_exists_if_folder(file_path: &str) {
     let path = std::path::Path::new(file_path);
     if !path.exists()
         && (path.extension().is_none()
-        || file_path.contains("whisper.cpp")
-        || file_path.ends_with('/')
-        || file_path.ends_with('\\'))
+            || file_path.contains("whisper.cpp")
+            || file_path.ends_with('/')
+            || file_path.ends_with('\\'))
     {
         let _ = std::fs::create_dir_all(path);
     }
@@ -763,7 +765,7 @@ pub fn trigger_gstreamer_warmup() {
                         let sym = dlsym(target_handle, c_sym.as_ptr());
                         if !sym.is_null() {
                             type GstInitFn =
-                            unsafe extern "C" fn(*mut i32, *mut *mut *mut std::ffi::c_char);
+                                unsafe extern "C" fn(*mut i32, *mut *mut *mut std::ffi::c_char);
                             let init_fn: GstInitFn = std::mem::transmute(sym);
                             init_fn(std::ptr::null_mut(), std::ptr::null_mut());
                         }
