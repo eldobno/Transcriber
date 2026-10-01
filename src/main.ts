@@ -1,42 +1,59 @@
 import { invoke } from "@tauri-apps/api/core";
 import "./styles.css";
 
-type HardwareInfo = {
-  os: string;
-  architecture: string;
-
-  nvidia_available: boolean;
-  gpu_name: string | null;
-  driver_version: string | null;
-  cuda_version: string | null;
-
-  ffmpeg_available: boolean;
-  ffmpeg_version: string | null;
-};
-
-async function loadHardwareInfo() {
+async function inspectBackend() {
   const output = document.querySelector<HTMLPreElement>("#output");
-
   if (!output) return;
 
-  output.textContent = "Detecting hardware...";
+  output.textContent = "Inspecting inherited backend...";
 
   try {
-    const info = await invoke<HardwareInfo>("get_hardware_info");
+    const [
+      system,
+      ffmpeg,
+      standard,
+      cuda,
+      vulkan,
+      openvino,
+    ] = await Promise.all([
+      invoke("get_system_specs"),
 
-    output.textContent = JSON.stringify(info, null, 2);
+      // Explicitly test system FFmpeg for now so we don't depend
+      // on Whisper Desktop's existing settings path yet.
+      invoke("get_ffmpeg_status", { source: "system" }),
+
+      invoke("check_build", { backend: "Standard" }),
+      invoke("check_build", { backend: "CUDA" }),
+      invoke("check_build", { backend: "Vulkan" }),
+      invoke("check_build", { backend: "OpenVINO" }),
+    ]);
+
+    output.textContent = JSON.stringify(
+        {
+          system,
+          ffmpeg,
+          whisperBackends: {
+            standard,
+            cuda,
+            vulkan,
+            openvino,
+          },
+        },
+        null,
+        2,
+    );
   } catch (error) {
-    output.textContent = `Hardware detection failed:\n${String(error)}`;
+    output.textContent = `Backend inspection failed:\n${String(error)}`;
   }
 }
 
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   <main>
     <h1>Transcriber</h1>
-    <p>Backend diagnostics</p>
+    <p>Inherited backend verification</p>
 
-    <button id="detect-button">
-      Detect Hardware
+    <button id="inspect-button">
+      Inspect Backend
     </button>
 
     <pre id="output">Ready.</pre>
@@ -44,5 +61,5 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
 `;
 
 document
-    .querySelector<HTMLButtonElement>("#detect-button")
-    ?.addEventListener("click", loadHardwareInfo);
+    .querySelector<HTMLButtonElement>("#inspect-button")
+    ?.addEventListener("click", inspectBackend);

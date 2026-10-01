@@ -1,16 +1,12 @@
 [package]
 name = "transcriber"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Local-first desktop transcription application"
+authors = ["Eldho Beno"]
+license = "GPL-3.0-or-later"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [lib]
-# The `_lib` suffix may seem redundant but it is necessary
-# to make the lib name unique and wouldn't conflict with the bin name.
-# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "transcriber_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
@@ -18,17 +14,35 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-clipboard-manager = "2"
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+sysinfo = "0.30"
 
-# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+httparse = "1.10"
+getrandom = "0.3"
+tempfile = "3"
+regex = "1"
+
+chrono = { version = "0.4", features = ["serde"] }
+
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+
+encoding_rs = "0.8"
+sha2 = "0.10"
+keyring = "2.1"
+
 [profile.release]
-codegen-units = 1
 lto = true
-opt-level = 3
-panic = "abort"
+codegen-units = 1
 strip = true
-
