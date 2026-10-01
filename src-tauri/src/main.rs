@@ -1,38 +1,42 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod settings;
+mod builder;
+mod downloader;
+pub mod ffmpeg_resolver;
+mod hardsub;
 mod hardware;
 mod logger;
-mod builder;
-mod transcribe;
-mod downloader;
-mod translation;
-mod hardsub;
-mod video_server;
 mod media_preview;
-pub mod ffmpeg_resolver;
+mod settings;
+mod transcribe;
+mod translation;
+mod video_server;
 
-use std::sync::{Arc, Mutex};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager, State};
 
-use settings::{WhisperSettings, load_settings_file, save_settings_file};
+use builder::check_build_exists;
+use downloader::{
+    delete_model_file, get_all_models_status, pause_download_model, start_download,
+    DownloadSession, DownloadState,
+};
+use hardsub::{
+    check_hardware_encoders, get_font_render_scale, get_system_fonts, start_hardsub_task,
+};
 use hardware::HardwareMonitor;
 use logger::AppLogs;
-use builder::check_build_exists;
-use transcribe::{probe_file_metadata, convert_to_wav, run_transcription, FileMetadata, TranscriptionResult, read_text_file};
-use downloader::{DownloadSession, DownloadState, start_download, get_all_models_status, pause_download_model, delete_model_file};
-use translation::{
-    fetch_provider_models,
-    translate_transcription_files,
-    preview_translate_first_lines,
-    cancel_preview_translate,
-    store_keyring_credential,
-    get_keyring_credential,
-    delete_keyring_credential,
+use settings::{load_settings_file, save_settings_file, WhisperSettings};
+use transcribe::{
+    convert_to_wav, probe_file_metadata, read_text_file, run_transcription, FileMetadata,
+    TranscriptionResult,
 };
-use hardsub::{get_system_fonts, check_hardware_encoders, get_font_render_scale, start_hardsub_task};
+use translation::{
+    cancel_preview_translate, delete_keyring_credential, fetch_provider_models,
+    get_keyring_credential, preview_translate_first_lines, store_keyring_credential,
+    translate_transcription_files,
+};
 
 // Tauri Managed States
 struct HardwareState(Arc<Mutex<HardwareMonitor>>);
@@ -144,7 +148,10 @@ async fn start_transcription_task(
 #[tauri::command]
 async fn cancel_transcription(session_state: State<'_, TranscriptionState>) -> Result<(), String> {
     let pid_to_kill = {
-        let mut lock = session_state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let mut lock = session_state
+            .0
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
         if lock.phase == SessionPhase::Idle {
             return Err("No active transcription or translation session".to_string());
         }
@@ -170,10 +177,7 @@ async fn cancel_transcription(session_state: State<'_, TranscriptionState>) -> R
         {
             let mut cmd = tokio::process::Command::new("taskkill");
             cmd.creation_flags(0x08000000);
-            let _ = cmd
-                .args(["/T", "/PID", &pid.to_string()])
-                .status()
-                .await;
+            let _ = cmd.args(["/T", "/PID", &pid.to_string()]).status().await;
         }
 
         // Poll session state instead of raw PID to avoid zombie process traps on Unix
@@ -251,7 +255,11 @@ async fn cancel_hardsub_task(
     };
 
     if let Some(pid) = pid_to_kill {
-        log_state.0.log(&app, "Hardsub", &format!("Cancellation requested for hardsub task (PID: {})", pid));
+        log_state.0.log(
+            &app,
+            "Hardsub",
+            &format!("Cancellation requested for hardsub task (PID: {})", pid),
+        );
         #[cfg(unix)]
         {
             let _ = tokio::process::Command::new("kill")
@@ -325,17 +333,32 @@ fn walk_models_dir(
             if is_dir {
                 let dir_name = path.file_name().unwrap_or_default().to_string_lossy();
                 // Avoid recursing into hidden directories or huge dependency/build directories
-                if !dir_name.starts_with('.') && dir_name != "node_modules" && dir_name != "target" && dir_name != "build" {
-                    walk_models_dir(&path, root, backend, depth + 1, visited, trans_models, vad_models);
+                if !dir_name.starts_with('.')
+                    && dir_name != "node_modules"
+                    && dir_name != "target"
+                    && dir_name != "build"
+                {
+                    walk_models_dir(
+                        &path,
+                        root,
+                        backend,
+                        depth + 1,
+                        visited,
+                        trans_models,
+                        vad_models,
+                    );
                 }
             } else if is_file {
                 let filename = path.file_name().unwrap_or_default().to_string_lossy();
-                if filename.ends_with(".bin") && (filename.contains("ggml-") || filename.contains("silero")) {
-                    let rel_path = path.strip_prefix(root)
+                if filename.ends_with(".bin")
+                    && (filename.contains("ggml-") || filename.contains("silero"))
+                {
+                    let rel_path = path
+                        .strip_prefix(root)
                         .unwrap_or(&path)
                         .to_string_lossy()
                         .replace('\\', "/");
-                        
+
                     if filename.contains("silero") {
                         vad_models.push(rel_path);
                     } else if !filename.contains("-openvino.bin") {
@@ -370,13 +393,24 @@ async fn scan_models(models_dir: String, backend: String) -> Result<ModelScanRes
         let models_dir_path = root;
 
         if models_dir_path.exists() && models_dir_path.is_dir() {
-            walk_models_dir(models_dir_path, root, &backend, 0, &mut visited, &mut trans_models, &mut vad_models);
+            walk_models_dir(
+                models_dir_path,
+                root,
+                &backend,
+                0,
+                &mut visited,
+                &mut trans_models,
+                &mut vad_models,
+            );
         }
 
         trans_models.sort();
         vad_models.sort();
 
-        ModelScanResult { trans_models, vad_models }
+        ModelScanResult {
+            trans_models,
+            vad_models,
+        }
     })
     .await
     .map_err(|e| format!("model scan failed: {}", e))
@@ -385,16 +419,16 @@ async fn scan_models(models_dir: String, backend: String) -> Result<ModelScanRes
 use tauri_plugin_dialog::DialogExt;
 
 pub const AUDIO_EXTENSIONS: &[&str] = &[
-    "mp3", "wav", "m4a", "aac", "flac", "ogg", "opus", "wma", "amr", "3ga", "aiff", "aif", "caf", "ape", "alac", "ac3", "dts", "oga",
+    "mp3", "wav", "m4a", "aac", "flac", "ogg", "opus", "wma", "amr", "3ga", "aiff", "aif", "caf",
+    "ape", "alac", "ac3", "dts", "oga",
 ];
 
 pub const VIDEO_EXTENSIONS: &[&str] = &[
-    "mp4", "mkv", "avi", "mov", "flv", "webm", "m4v", "wmv", "ts", "mts", "m2ts", "3gp", "3g2", "mpeg", "mpg", "vob", "ogv", "f4v",
+    "mp4", "mkv", "avi", "mov", "flv", "webm", "m4v", "wmv", "ts", "mts", "m2ts", "3gp", "3g2",
+    "mpeg", "mpg", "vob", "ogv", "f4v",
 ];
 
-pub const SUBTITLE_EXTENSIONS: &[&str] = &[
-    "srt", "vtt", "ass", "ssa", "sub", "lrc",
-];
+pub const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "vtt", "ass", "ssa", "sub", "lrc"];
 
 fn get_filter_variants(exts: &[&str]) -> Vec<String> {
     let mut v = Vec::with_capacity(exts.len() * 2);
@@ -419,7 +453,10 @@ async fn select_file(app: AppHandle) -> Option<String> {
             let _ = tx.send(file);
         });
     match rx.await {
-        Ok(Some(file_path)) => file_path.into_path().ok().map(|p| p.to_string_lossy().to_string()),
+        Ok(Some(file_path)) => file_path
+            .into_path()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string()),
         Ok(None) => None,
         Err(e) => {
             eprintln!("[Dialog Error] select_file channel error: {}", e);
@@ -442,7 +479,10 @@ async fn select_subtitle_file(app: AppHandle) -> Option<String> {
             let _ = tx.send(file);
         });
     match rx.await {
-        Ok(Some(file_path)) => file_path.into_path().ok().map(|p| p.to_string_lossy().to_string()),
+        Ok(Some(file_path)) => file_path
+            .into_path()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string()),
         Ok(None) => None,
         Err(e) => {
             eprintln!("[Dialog Error] select_subtitle_file channel error: {}", e);
@@ -466,15 +506,30 @@ async fn select_files(app: AppHandle) -> Option<Vec<String>> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
-        .add_filter("All Media (*.mp3, *.wav, *.mp4, *.mkv, *.opus, ...)", &all_media_refs)
-        .add_filter("Audio Files (*.mp3, *.wav, *.m4a, *.opus, *.flac, ...)", &audio_refs)
-        .add_filter("Video Files (*.mp4, *.mkv, *.mov, *.webm, ...)", &video_refs)
+        .add_filter(
+            "All Media (*.mp3, *.wav, *.mp4, *.mkv, *.opus, ...)",
+            &all_media_refs,
+        )
+        .add_filter(
+            "Audio Files (*.mp3, *.wav, *.m4a, *.opus, *.flac, ...)",
+            &audio_refs,
+        )
+        .add_filter(
+            "Video Files (*.mp4, *.mkv, *.mov, *.webm, ...)",
+            &video_refs,
+        )
         .add_filter("All Files (*)", &["*"])
         .pick_files(move |files| {
             let _ = tx.send(files);
         });
     match rx.await {
-        Ok(Some(files)) => Some(files.into_iter().filter_map(|p| p.into_path().ok()).map(|p| p.to_string_lossy().to_string()).collect()),
+        Ok(Some(files)) => Some(
+            files
+                .into_iter()
+                .filter_map(|p| p.into_path().ok())
+                .map(|p| p.to_string_lossy().to_string())
+                .collect(),
+        ),
         Ok(None) => None,
         Err(e) => {
             eprintln!("[Dialog Error] select_files channel error: {}", e);
@@ -486,12 +541,14 @@ async fn select_files(app: AppHandle) -> Option<Vec<String>> {
 #[tauri::command]
 async fn select_directory(app: AppHandle) -> Option<String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog()
-        .file()
-        .pick_folder(move |dir| {
-            let _ = tx.send(dir);
-        });
-    rx.await.ok().flatten().and_then(|p| p.into_path().ok()).map(|p| p.to_string_lossy().to_string())
+    app.dialog().file().pick_folder(move |dir| {
+        let _ = tx.send(dir);
+    });
+    rx.await
+        .ok()
+        .flatten()
+        .and_then(|p| p.into_path().ok())
+        .map(|p| p.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -506,7 +563,11 @@ async fn verify_directory_writable(dir_path: String) -> Result<(), String> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let test_file = p.join(format!(".whisper_perm_test_{}_{}", std::process::id(), nonce));
+        let test_file = p.join(format!(
+            ".whisper_perm_test_{}_{}",
+            std::process::id(),
+            nonce
+        ));
         std::fs::write(&test_file, b"ok")
             .map_err(|e| format!("Directory '{}' is not writable: {}", dir_path, e))?;
         let _ = std::fs::remove_file(&test_file);
@@ -516,8 +577,6 @@ async fn verify_directory_writable(dir_path: String) -> Result<(), String> {
     .map_err(|e| format!("Directory check failed: {e}"))?
 }
 
-
-
 #[tauri::command]
 fn read_text_file_content(file_path: String) -> Result<String, String> {
     let path = std::path::Path::new(&file_path);
@@ -526,7 +585,9 @@ fn read_text_file_content(file_path: String) -> Result<String, String> {
     if !allowed_exts.contains(&ext) {
         return Err("File type not allowed".into());
     }
-    let canonical = path.canonicalize().map_err(|_| "Invalid file path".to_string())?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| "Invalid file path".to_string())?;
     read_text_file(canonical.to_string_lossy().to_string())
 }
 
@@ -579,7 +640,10 @@ fn start_download_model_task(
 }
 
 #[tauri::command]
-fn get_ffmpeg_status(app: AppHandle, source: Option<String>) -> crate::ffmpeg_resolver::FFmpegStatus {
+fn get_ffmpeg_status(
+    app: AppHandle,
+    source: Option<String>,
+) -> crate::ffmpeg_resolver::FFmpegStatus {
     crate::ffmpeg_resolver::get_current_ffmpeg_status(Some(&app), source)
 }
 
@@ -593,7 +657,12 @@ fn copy_to_clipboard(app: AppHandle, text: String) -> Result<(), String> {
 
 pub(crate) fn ensure_directory_exists_if_folder(file_path: &str) {
     let path = std::path::Path::new(file_path);
-    if !path.exists() && (path.extension().is_none() || file_path.contains("whisper.cpp") || file_path.ends_with('/') || file_path.ends_with('\\')) {
+    if !path.exists()
+        && (path.extension().is_none()
+            || file_path.contains("whisper.cpp")
+            || file_path.ends_with('/')
+            || file_path.ends_with('\\'))
+    {
         let _ = std::fs::create_dir_all(path);
     }
 }
@@ -659,8 +728,14 @@ pub fn trigger_gstreamer_warmup() {
         .name("gst-warmup".into())
         .spawn(|| {
             extern "C" {
-                fn dlopen(filename: *const std::ffi::c_char, flag: std::ffi::c_int) -> *mut std::ffi::c_void;
-                fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+                fn dlopen(
+                    filename: *const std::ffi::c_char,
+                    flag: std::ffi::c_int,
+                ) -> *mut std::ffi::c_void;
+                fn dlsym(
+                    handle: *mut std::ffi::c_void,
+                    symbol: *const std::ffi::c_char,
+                ) -> *mut std::ffi::c_void;
                 fn dlclose(handle: *mut std::ffi::c_void) -> std::ffi::c_int;
             }
 
@@ -668,12 +743,17 @@ pub fn trigger_gstreamer_warmup() {
                 let lib_name = std::ffi::CString::new("libgstreamer-1.0.so.0").ok();
                 if let Some(c_name) = lib_name {
                     let handle = dlopen(c_name.as_ptr(), 1); // RTLD_LAZY = 1
-                    let target_handle = if !handle.is_null() { handle } else { std::ptr::null_mut() };
+                    let target_handle = if !handle.is_null() {
+                        handle
+                    } else {
+                        std::ptr::null_mut()
+                    };
                     let sym_name = std::ffi::CString::new("gst_init").ok();
                     if let Some(c_sym) = sym_name {
                         let sym = dlsym(target_handle, c_sym.as_ptr());
                         if !sym.is_null() {
-                            type GstInitFn = unsafe extern "C" fn(*mut i32, *mut *mut *mut std::ffi::c_char);
+                            type GstInitFn =
+                                unsafe extern "C" fn(*mut i32, *mut *mut *mut std::ffi::c_char);
                             let init_fn: GstInitFn = std::mem::transmute(sym);
                             init_fn(std::ptr::null_mut(), std::ptr::null_mut());
                         }
@@ -799,7 +879,9 @@ fn exit_app(app: AppHandle) {
 #[tauri::command]
 fn hide_to_tray(app: AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("main") {
-        window.hide().map_err(|e| format!("Failed to hide window: {}", e))
+        window
+            .hide()
+            .map_err(|e| format!("Failed to hide window: {}", e))
     } else {
         Ok(())
     }
@@ -810,7 +892,9 @@ fn set_window_zoom(window: tauri::WebviewWindow, scale: f64) -> Result<(), Strin
     if !scale.is_finite() || scale <= 0.0 {
         return Err("Scale must be a positive finite number".to_string());
     }
-    window.set_zoom(scale).map_err(|e| format!("Failed to set webview zoom: {}", e))
+    window
+        .set_zoom(scale)
+        .map_err(|e| format!("Failed to set webview zoom: {}", e))
 }
 
 fn main() {
@@ -899,7 +983,9 @@ fn main() {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            if name.starts_with("whisper_appimage_gst_registry_") && name.ends_with(".bin") {
+                            if name.starts_with("whisper_appimage_gst_registry_")
+                                && name.ends_with(".bin")
+                            {
                                 let _ = std::fs::remove_file(path);
                             }
                         }
@@ -911,10 +997,14 @@ fn main() {
                 let cache_base = std::env::var("XDG_CACHE_HOME")
                     .map(std::path::PathBuf::from)
                     .ok()
-                    .or_else(|| std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")).ok())
+                    .or_else(|| {
+                        std::env::var("HOME")
+                            .map(|h| std::path::PathBuf::from(h).join(".cache"))
+                            .ok()
+                    })
                     .unwrap_or_else(std::env::temp_dir);
 
-                let app_cache_dir = cache_base.join("whisper-desktop");
+                let app_cache_dir = cache_base.join("transcriber");
                 let _ = std::fs::create_dir_all(&app_cache_dir);
                 let registry_path = app_cache_dir.join("appimage_gst_registry_v3.bin");
                 std::env::set_var("GST_REGISTRY_1_0", registry_path.to_string_lossy().as_ref());
@@ -966,14 +1056,20 @@ fn main() {
                 let joined = existing_gst_dirs.join(":");
                 if let Ok(existing_sys) = std::env::var("GST_PLUGIN_SYSTEM_PATH_1_0") {
                     if !existing_sys.contains(&joined) {
-                        std::env::set_var("GST_PLUGIN_SYSTEM_PATH_1_0", format!("{}:{}", existing_sys, joined));
+                        std::env::set_var(
+                            "GST_PLUGIN_SYSTEM_PATH_1_0",
+                            format!("{}:{}", existing_sys, joined),
+                        );
                     }
                 } else {
                     std::env::set_var("GST_PLUGIN_SYSTEM_PATH_1_0", &joined);
                 }
                 if let Ok(existing_path) = std::env::var("GST_PLUGIN_PATH_1_0") {
                     if !existing_path.contains(&joined) {
-                        std::env::set_var("GST_PLUGIN_PATH_1_0", format!("{}:{}", existing_path, joined));
+                        std::env::set_var(
+                            "GST_PLUGIN_PATH_1_0",
+                            format!("{}:{}", existing_path, joined),
+                        );
                     }
                 } else {
                     std::env::set_var("GST_PLUGIN_PATH_1_0", &joined);
@@ -999,13 +1095,18 @@ fn main() {
 
     let app = tauri::Builder::default()
         .setup(move |_app| {
-            let media_server = Arc::new(tauri::async_runtime::block_on(video_server::MediaServer::start())
-                .map_err(std::io::Error::other)?);
+            let media_server = Arc::new(
+                tauri::async_runtime::block_on(video_server::MediaServer::start())
+                    .map_err(std::io::Error::other)?,
+            );
             let preview_root = _app.path().app_cache_dir()?.join("hardsub-preview");
             if preview_root.exists() {
                 let _ = std::fs::remove_dir_all(&preview_root);
             }
-            _app.manage(media_preview::PreviewState::new(media_server.clone(), preview_root));
+            _app.manage(media_preview::PreviewState::new(
+                media_server.clone(),
+                preview_root,
+            ));
             _app.manage(media_server);
             let logs_for_sink = app_logs_for_sink.clone();
             let handle_for_sink = _app.handle().clone();
@@ -1020,8 +1121,10 @@ fn main() {
                 Manager,
             };
 
-            let show_item = MenuItem::with_id(_app, "show", "Open Whisper Desktop", true, None::<&str>)?;
-            let quit_item = MenuItem::with_id(_app, "quit", "Quit Application", true, None::<&str>)?;
+            let show_item =
+                MenuItem::with_id(_app, "show", "Open Whisper Desktop", true, None::<&str>)?;
+            let quit_item =
+                MenuItem::with_id(_app, "quit", "Quit Application", true, None::<&str>)?;
             let tray_menu = Menu::with_items(_app, &[&show_item, &quit_item])?;
 
             if let Some(icon) = _app.default_window_icon() {
@@ -1075,7 +1178,7 @@ fn main() {
 
             #[cfg(target_os = "linux")]
             {
-                use webkit2gtk::{WebViewExt, PermissionRequestExt, SettingsExt};
+                use webkit2gtk::{PermissionRequestExt, SettingsExt, WebViewExt};
                 if let Some(window) = _app.get_webview_window("main") {
                     let _ = window.with_webview(move |webview| {
                         let webview = webview.inner();
@@ -1156,14 +1259,23 @@ fn main() {
     app.run(move |app, event| {
         if let tauri::RunEvent::ExitRequested { api, .. } = event {
             use std::sync::atomic::Ordering;
-            if exit_state.load(Ordering::Acquire) == 2 { return; }
+            if exit_state.load(Ordering::Acquire) == 2 {
+                return;
+            }
             api.prevent_exit();
-            if exit_state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() { return; }
+            if exit_state
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
+            }
             let app = app.clone();
             let exit_state = exit_state.clone();
             tauri::async_runtime::spawn(async move {
                 app.state::<media_preview::PreviewState>().shutdown().await;
-                app.state::<Arc<video_server::MediaServer>>().shutdown().await;
+                app.state::<Arc<video_server::MediaServer>>()
+                    .shutdown()
+                    .await;
                 exit_state.store(2, Ordering::Release);
                 app.exit(0);
             });
@@ -1195,7 +1307,10 @@ mod main_tests {
     #[cfg(target_os = "linux")]
     fn test_clean_ld_paths_filters_appdir_and_mount() {
         let appdir = "/tmp/.mount_whispe12345";
-        let raw = format!("{}/usr/lib:/usr/local/lib:{}/lib:/tmp/.mount_other/lib:/opt/custom/lib", appdir, appdir);
+        let raw = format!(
+            "{}/usr/lib:/usr/local/lib:{}/lib:/tmp/.mount_other/lib:/opt/custom/lib",
+            appdir, appdir
+        );
         let cleaned = clean_ld_paths(&raw, appdir);
         assert_eq!(cleaned, Some("/usr/local/lib:/opt/custom/lib".to_string()));
     }

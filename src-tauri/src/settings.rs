@@ -1,8 +1,8 @@
-use serde::{Serialize, Deserialize};
+use crate::translation::provider::AiProvider;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
-use crate::translation::provider::AiProvider;
 
 static SETTINGS_LOCK: RwLock<()> = RwLock::new(());
 type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
@@ -109,7 +109,10 @@ pub struct WhisperSettings {
     pub output_dir_mode: String, // "input_dir" or "custom"
     #[serde(default)]
     pub output_dir_path: String,
-    #[serde(default = "default_ui_scale", deserialize_with = "deserialize_f64_lenient")]
+    #[serde(
+        default = "default_ui_scale",
+        deserialize_with = "deserialize_f64_lenient"
+    )]
     pub ui_scale: f64,
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -143,7 +146,10 @@ where
             if trimmed.is_empty() {
                 return Ok(0);
             }
-            trimmed.parse::<i32>().or_else(|_| trimmed.parse::<f64>().map(|f| f as i32)).map_err(serde::de::Error::custom)
+            trimmed
+                .parse::<i32>()
+                .or_else(|_| trimmed.parse::<f64>().map(|f| f as i32))
+                .map_err(serde::de::Error::custom)
         }
     }
 }
@@ -343,7 +349,8 @@ impl WhisperSettings {
         }
 
         self.recent_spoken_languages = sanitize_recent_list(&self.recent_spoken_languages, true);
-        self.recent_translation_targets = sanitize_recent_list(&self.recent_translation_targets, false);
+        self.recent_translation_targets =
+            sanitize_recent_list(&self.recent_translation_targets, false);
     }
 }
 
@@ -353,7 +360,11 @@ fn sanitize_recent_list(raw: &[String], lowercase: bool) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for value in raw {
-        let cleaned = if lowercase { value.trim().to_lowercase() } else { value.trim().to_string() };
+        let cleaned = if lowercase {
+            value.trim().to_lowercase()
+        } else {
+            value.trim().to_string()
+        };
         if cleaned.is_empty() || (lowercase && cleaned == "auto") || !seen.insert(cleaned.clone()) {
             continue;
         }
@@ -375,8 +386,8 @@ fn sanitize_recent_list(raw: &[String], lowercase: bool) -> Vec<String> {
 /// 5. Otherwise, defaults to `<HOME>/whisper-desktop/models`.
 pub fn resolve_default_models_dir() -> PathBuf {
     let home = get_user_home_dir();
-    let modern = home.join("whisper-desktop").join("models");
-    let modern_flat = home.join("whisper-desktop");
+    let modern = home.join("transcriber").join("models");
+    let modern_flat = home.join("transcriber");
     let legacy = home.join("whisper.cpp");
     let legacy_models = legacy.join("models");
 
@@ -452,7 +463,7 @@ pub fn get_settings_path() -> PathBuf {
         if let Ok(app_data) = std::env::var("APPDATA") {
             if !app_data.trim().is_empty() {
                 let mut path = PathBuf::from(app_data);
-                path.push("whisper-desktop");
+                path.push("transcriber");
                 path.push("settings.json");
                 return path;
             }
@@ -460,7 +471,7 @@ pub fn get_settings_path() -> PathBuf {
         let mut path = get_user_home_dir();
         path.push("AppData");
         path.push("Roaming");
-        path.push("whisper-desktop");
+        path.push("transcriber");
         path.push("settings.json");
         return path;
     }
@@ -470,7 +481,7 @@ pub fn get_settings_path() -> PathBuf {
         let mut path = get_user_home_dir();
         path.push("Library");
         path.push("Application Support");
-        path.push("whisper-desktop");
+        path.push("transcriber");
         path.push("settings.json");
         return path;
     }
@@ -480,14 +491,14 @@ pub fn get_settings_path() -> PathBuf {
         if let Ok(xdg_config) = std::env::var("XDG_CONFIG_HOME") {
             if !xdg_config.trim().is_empty() {
                 let mut path = PathBuf::from(xdg_config);
-                path.push("whisper-desktop");
+                path.push("transcriber");
                 path.push("settings.json");
                 return path;
             }
         }
         let mut path = get_user_home_dir();
         path.push(".config");
-        path.push("whisper-desktop");
+        path.push("transcriber");
         path.push("settings.json");
         path
     }
@@ -705,7 +716,10 @@ fn sanitize_providers(providers_json: &str) -> String {
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     if uses_keyring {
-                        obj.insert("apiKey".to_string(), serde_json::Value::String("__KEYRING__".to_string()));
+                        obj.insert(
+                            "apiKey".to_string(),
+                            serde_json::Value::String("__KEYRING__".to_string()),
+                        );
                     }
                 }
             }
@@ -918,9 +932,8 @@ mod tests {
 
     #[test]
     fn update_settings_locked_aborts_write_on_err() {
-        let result = update_settings_locked(|_settings| {
-            Err::<(), &str>("simulated error during mutation")
-        });
+        let result =
+            update_settings_locked(|_settings| Err::<(), &str>("simulated error during mutation"));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("simulated error"));
     }
@@ -1057,8 +1070,8 @@ mod tests {
     #[test]
     fn test_default_models_dir_resolution() {
         let home = get_user_home_dir();
-        let modern = home.join("whisper-desktop").join("models");
-        let modern_flat = home.join("whisper-desktop");
+        let modern = home.join("transcriber").join("models");
+        let modern_flat = home.join("transcriber");
         let legacy = home.join("whisper.cpp");
         let legacy_models = legacy.join("models");
         let resolved = resolve_default_models_dir();
@@ -1105,4 +1118,3 @@ mod tests {
         assert_eq!(sanitized_targets, vec!["Persian", "English", "German"]);
     }
 }
-

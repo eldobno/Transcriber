@@ -22,3 +22,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local Transcriber runtime binaries
+src-tauri/resources/*.exe
+src-tauri/resources/*.dll
+src-tauri/resources/ffmpeg*
+src-tauri/resources/ffprobe*
