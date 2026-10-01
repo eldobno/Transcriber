@@ -146,16 +146,18 @@ async fn start_transcription_task(
     run_transcription(app, logs, session, settings, wav_path, duration_sec).await
 }
 
-#[tauri::command]
-async fn cancel_transcription(session_state: State<'_, TranscriptionState>) -> Result<(), String> {
+pub(crate) async fn cancel_transcription_session(
+    session: Arc<Mutex<TranscriptionSession>>,
+) -> Result<(), String> {
     let pid_to_kill = {
-        let mut lock = session_state
-            .0
+        let mut lock = session
             .lock()
             .map_err(|e| format!("Lock error: {}", e))?;
+
         if lock.phase == SessionPhase::Idle {
             return Err("No active transcription or translation session".to_string());
         }
+
         lock.cancel_requested = true;
         lock.child_pid
     };
@@ -188,7 +190,8 @@ async fn cancel_transcription(session_state: State<'_, TranscriptionState>) -> R
 
         while std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(75)).await;
-            if let Ok(lock) = session_state.0.lock() {
+
+            if let Ok(lock) = session.lock() {
                 if lock.phase == SessionPhase::Idle {
                     session_ended = true;
                     break;
@@ -200,7 +203,7 @@ async fn cancel_transcription(session_state: State<'_, TranscriptionState>) -> R
             // The child may have exited during the grace window and its PID been
             // recycled by an unrelated process. Only hard-kill if the process
             // still exists AND still belongs to our session (phase not Idle).
-            let pid_still_ours = if let Ok(lock) = session_state.0.lock() {
+            let pid_still_ours = if let Ok(lock) = session.lock() {
                 lock.phase != SessionPhase::Idle && lock.child_pid == Some(pid)
             } else {
                 false
@@ -238,6 +241,11 @@ async fn cancel_transcription(session_state: State<'_, TranscriptionState>) -> R
     }
 
     Ok(())
+}
+
+#[tauri::command]
+async fn cancel_transcription(session_state: State<'_, TranscriptionState>) -> Result<(), String> {
+    cancel_transcription_session(session_state.0.clone()).await
 }
 
 #[tauri::command]
@@ -413,8 +421,8 @@ async fn scan_models(models_dir: String, backend: String) -> Result<ModelScanRes
             vad_models,
         }
     })
-    .await
-    .map_err(|e| format!("model scan failed: {}", e))
+        .await
+        .map_err(|e| format!("model scan failed: {}", e))
 }
 
 use tauri_plugin_dialog::DialogExt;
@@ -574,8 +582,8 @@ async fn verify_directory_writable(dir_path: String) -> Result<(), String> {
         let _ = std::fs::remove_file(&test_file);
         Ok(())
     })
-    .await
-    .map_err(|e| format!("Directory check failed: {e}"))?
+        .await
+        .map_err(|e| format!("Directory check failed: {e}"))?
 }
 
 #[tauri::command]
@@ -660,9 +668,9 @@ pub(crate) fn ensure_directory_exists_if_folder(file_path: &str) {
     let path = std::path::Path::new(file_path);
     if !path.exists()
         && (path.extension().is_none()
-            || file_path.contains("whisper.cpp")
-            || file_path.ends_with('/')
-            || file_path.ends_with('\\'))
+        || file_path.contains("whisper.cpp")
+        || file_path.ends_with('/')
+        || file_path.ends_with('\\'))
     {
         let _ = std::fs::create_dir_all(path);
     }
@@ -754,7 +762,7 @@ pub fn trigger_gstreamer_warmup() {
                         let sym = dlsym(target_handle, c_sym.as_ptr());
                         if !sym.is_null() {
                             type GstInitFn =
-                                unsafe extern "C" fn(*mut i32, *mut *mut *mut std::ffi::c_char);
+                            unsafe extern "C" fn(*mut i32, *mut *mut *mut std::ffi::c_char);
                             let init_fn: GstInitFn = std::mem::transmute(sym);
                             init_fn(std::ptr::null_mut(), std::ptr::null_mut());
                         }
@@ -1218,6 +1226,7 @@ fn main() {
             job_queue::remove_queue_job,
             job_queue::clear_job_queue,
             job_queue::start_job_queue,
+            job_queue::cancel_queue_job,
 
             check_build,
             probe_media_file,

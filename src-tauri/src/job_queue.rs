@@ -212,19 +212,28 @@ pub async fn add_job_queue_files(
             .map_err(|error| format!("Queue lock error: {error}"))?;
 
         if let Some(job) = queue.jobs.iter_mut().find(|job| job.id == job_id) {
-            job.file_name = metadata.name;
-            job.format = metadata.format;
-            job.size = metadata.size;
-            job.duration_sec = metadata.duration_sec;
-
-            if metadata.exists {
-                job.status = JobStatus::Ready;
-                job.message = Some("Ready".to_string());
+            // A cancellation can arrive while ffprobe is still inspecting the file.
+            // Do not let the inspection result resurrect a cancelled job.
+            if job.cancel_requested {
+                job.status = JobStatus::Cancelled;
+                job.progress = 0.0;
+                job.message = Some("Cancelled".to_string());
                 job.error = None;
             } else {
-                job.status = JobStatus::Failed;
-                job.message = Some("Problem".to_string());
-                job.error = Some("The source file no longer exists.".to_string());
+                job.file_name = metadata.name;
+                job.format = metadata.format;
+                job.size = metadata.size;
+                job.duration_sec = metadata.duration_sec;
+
+                if metadata.exists {
+                    job.status = JobStatus::Ready;
+                    job.message = Some("Ready".to_string());
+                    job.error = None;
+                } else {
+                    job.status = JobStatus::Failed;
+                    job.message = Some("Problem".to_string());
+                    job.error = Some("The source file no longer exists.".to_string());
+                }
             }
         }
 
@@ -325,6 +334,75 @@ pub fn clear_job_queue(
     Ok(snapshot(&queue))
 }
 
+#[tauri::command]
+pub async fn cancel_queue_job(
+    app: AppHandle,
+    state: State<'_, JobQueueState>,
+    session_state: State<'_, crate::TranscriptionState>,
+    job_id: String,
+) -> Result<JobQueueSnapshot, String> {
+    let should_cancel_session = {
+        let mut queue = state
+            .0
+            .lock()
+            .map_err(|error| format!("Queue lock error: {error}"))?;
+
+        let job = queue
+            .jobs
+            .iter_mut()
+            .find(|job| job.id == job_id)
+            .ok_or_else(|| "Queue job not found.".to_string())?;
+
+        let active = matches!(
+            job.status,
+            JobStatus::Converting | JobStatus::Transcribing
+        );
+
+        match job.status {
+            JobStatus::Inspecting | JobStatus::Ready | JobStatus::Queued => {
+                job.cancel_requested = true;
+                job.status = JobStatus::Cancelled;
+                job.progress = 0.0;
+                job.message = Some("Cancelled".to_string());
+                job.error = None;
+            }
+
+            JobStatus::Converting | JobStatus::Transcribing => {
+                job.cancel_requested = true;
+                job.message = Some("Cancelling...".to_string());
+            }
+
+            JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled => {
+                return Ok(snapshot(&queue));
+            }
+        }
+
+        emit_queue(&app, &queue);
+        active
+    };
+
+    if should_cancel_session {
+        // There is a very small gap between conversion and transcription where
+        // the queue still looks active but the shared transcription session has
+        // already returned to Idle. In that case the queue-level cancellation
+        // flag is enough; start_job_queue checks it before starting Whisper.
+        if let Err(error) =
+            crate::cancel_transcription_session(session_state.0.clone()).await
+        {
+            if !error.contains("No active transcription or translation session") {
+                return Err(error);
+            }
+        }
+    }
+
+    let queue = state
+        .0
+        .lock()
+        .map_err(|error| format!("Queue lock error: {error}"))?;
+
+    Ok(snapshot(&queue))
+}
+
 fn looks_cancelled(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("cancel") || error.contains("aborted")
@@ -355,13 +433,13 @@ pub async fn start_job_queue(
         let mut has_work = false;
 
         for job in &mut queue.jobs {
-            if job.status == JobStatus::Ready {
+            if job.status == JobStatus::Ready && !job.cancel_requested {
                 job.status = JobStatus::Queued;
                 job.progress = 0.0;
                 job.message = Some("Queued".to_string());
                 job.error = None;
                 has_work = true;
-            } else if job.status == JobStatus::Queued {
+            } else if job.status == JobStatus::Queued && !job.cancel_requested {
                 has_work = true;
             }
         }
@@ -384,7 +462,7 @@ pub async fn start_job_queue(
             let Some(index) = queue
                 .jobs
                 .iter()
-                .position(|job| job.status == JobStatus::Queued)
+                .position(|job| job.status == JobStatus::Queued && !job.cancel_requested)
             else {
                 queue.running = false;
                 emit_queue(&app, &queue);
@@ -417,7 +495,7 @@ pub async fn start_job_queue(
             session.clone(),
             source_path.clone(),
         )
-        .await
+            .await
         {
             Ok(path) => path,
 
@@ -427,15 +505,16 @@ pub async fn start_job_queue(
                     .map_err(|lock_error| format!("Queue lock error: {lock_error}"))?;
 
                 if let Some(job) = queue.jobs.iter_mut().find(|job| job.id == job_id) {
-                    if looks_cancelled(&error) {
+                    if job.cancel_requested || looks_cancelled(&error) {
                         job.status = JobStatus::Cancelled;
+                        job.progress = 0.0;
                         job.message = Some("Cancelled".to_string());
+                        job.error = None;
                     } else {
                         job.status = JobStatus::Failed;
                         job.message = Some("Conversion failed".to_string());
+                        job.error = Some(error);
                     }
-
-                    job.error = Some(error);
                 }
 
                 // A failed file must NOT stop the rest of the queue.
@@ -448,18 +527,39 @@ pub async fn start_job_queue(
         // Conversion succeeded → transcription begins
         // ----------------------------------------------------
 
-        {
+        // Cancellation can land in the tiny interval after FFmpeg finishes and
+        // before Whisper starts. Honour that request and remove the temp WAV.
+        let cancelled_before_transcription = {
             let mut queue = queue_state
                 .lock()
                 .map_err(|error| format!("Queue lock error: {error}"))?;
 
-            if let Some(job) = queue.jobs.iter_mut().find(|job| job.id == job_id) {
-                job.status = JobStatus::Transcribing;
-                job.progress = 0.0;
-                job.message = Some("Transcribing".to_string());
-            }
+            let cancelled = if let Some(job) =
+                queue.jobs.iter_mut().find(|job| job.id == job_id)
+            {
+                if job.cancel_requested {
+                    job.status = JobStatus::Cancelled;
+                    job.progress = 0.0;
+                    job.message = Some("Cancelled".to_string());
+                    job.error = None;
+                    true
+                } else {
+                    job.status = JobStatus::Transcribing;
+                    job.progress = 0.0;
+                    job.message = Some("Transcribing".to_string());
+                    false
+                }
+            } else {
+                true
+            };
 
             emit_queue(&app, &queue);
+            cancelled
+        };
+
+        if cancelled_before_transcription {
+            let _ = std::fs::remove_file(&wav_path);
+            continue;
         }
 
         // Every queued file gets the selected global transcription
@@ -479,7 +579,7 @@ pub async fn start_job_queue(
             wav_path,
             duration_sec,
         )
-        .await
+            .await
         {
             Ok(result) => {
                 let mut queue = queue_state
@@ -495,6 +595,7 @@ pub async fn start_job_queue(
                     ));
                     job.output_files = result.generated_files;
                     job.error = None;
+                    job.cancel_requested = false;
                 }
 
                 emit_queue(&app, &queue);
@@ -506,15 +607,16 @@ pub async fn start_job_queue(
                     .map_err(|lock_error| format!("Queue lock error: {lock_error}"))?;
 
                 if let Some(job) = queue.jobs.iter_mut().find(|job| job.id == job_id) {
-                    if looks_cancelled(&error) {
+                    if job.cancel_requested || looks_cancelled(&error) {
                         job.status = JobStatus::Cancelled;
+                        job.progress = 0.0;
                         job.message = Some("Cancelled".to_string());
+                        job.error = None;
                     } else {
                         job.status = JobStatus::Failed;
                         job.message = Some("Transcription failed".to_string());
+                        job.error = Some(error);
                     }
-
-                    job.error = Some(error);
                 }
 
                 // Again: failure does not terminate the queue.

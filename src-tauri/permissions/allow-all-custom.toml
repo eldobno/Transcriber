@@ -50,12 +50,13 @@ allow = [
   "exit_app",
   "hide_to_tray",
   "set_window_zoom",
-  
+
   "get_job_queue",
   "add_job_queue_files",
   "move_queue_job",
   "remove_queue_job",
   "clear_job_queue",
-  "start_job_queue"
+  "start_job_queue",
+  "cancel_queue_job",
 ]
 
