@@ -6,9 +6,10 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, State};
+use tauri_plugin_notification::NotificationExt;
 
 use crate::transcribe::probe_file_metadata;
 
@@ -44,6 +45,10 @@ pub struct QueueJob {
     pub error: Option<String>,
     pub duration_ms: Option<u64>,
     pub speed_factor: Option<f64>,
+    pub conversion_ms: Option<u64>,
+    pub diarization_ms: Option<u64>,
+    pub transcription_ms: Option<u64>,
+    pub finalization_ms: Option<u64>,
     pub created_at_ms: u64,
     pub started_at_ms: Option<u64>,
     pub completed_at_ms: Option<u64>,
@@ -324,6 +329,10 @@ pub async fn add_job_queue_files(
                 error: None,
                 duration_ms: None,
                 speed_factor: None,
+                conversion_ms: None,
+                diarization_ms: None,
+                transcription_ms: None,
+                finalization_ms: None,
                 created_at_ms: now_ms(),
                 started_at_ms: None,
                 completed_at_ms: None,
@@ -566,6 +575,7 @@ pub async fn start_job_queue(
     let queue_state = state.0.clone();
     let logs = log_state.0.clone();
     let session = session_state.0.clone();
+    let queue_run_started_ms = now_ms();
 
     // Turn all Ready jobs into queued work.
     {
@@ -599,7 +609,15 @@ pub async fn start_job_queue(
         emit_queue(&app, &queue);
     }
 
-    loop {
+    let _sleep_inhibitor = match crate::power::SleepInhibitor::acquire() {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            logs.log(&app, "Queue", &format!("Could not prevent system sleep: {error}"));
+            None
+        }
+    };
+
+    let final_snapshot = loop {
         // Pick exactly one queued job.
         let next_job = {
             let mut queue = queue_state
@@ -613,7 +631,7 @@ pub async fn start_job_queue(
             else {
                 queue.running = false;
                 emit_queue(&app, &queue);
-                return Ok(snapshot(&queue));
+                break snapshot(&queue);
             };
 
             let job = &mut queue.jobs[index];
@@ -624,6 +642,12 @@ pub async fn start_job_queue(
             job.error = None;
             job.started_at_ms = Some(now_ms());
             job.completed_at_ms = None;
+            job.duration_ms = None;
+            job.speed_factor = None;
+            job.conversion_ms = None;
+            job.diarization_ms = None;
+            job.transcription_ms = None;
+            job.finalization_ms = None;
 
             let data = (
                 job.id.clone(),
@@ -648,17 +672,28 @@ pub async fn start_job_queue(
         }
 
         // ----------------------------------------------------
-        // Existing Whisper Desktop FFmpeg pipeline
+        // Existing FFmpeg conversion pipeline
         // ----------------------------------------------------
 
-        let wav_path = match crate::transcribe::convert_to_wav(
+        let conversion_started = Instant::now();
+        let conversion_result = crate::transcribe::convert_to_wav(
             app.clone(),
             logs.clone(),
             session.clone(),
             source_path.clone(),
         )
-        .await
+        .await;
+        let conversion_ms = conversion_started.elapsed().as_millis() as u64;
         {
+            let mut queue = queue_state
+                .lock()
+                .map_err(|error| format!("Queue lock error: {error}"))?;
+            if let Some(job) = queue.jobs.iter_mut().find(|job| job.id == job_id) {
+                job.conversion_ms = Some(conversion_ms);
+            }
+        }
+
+        let wav_path = match conversion_result {
             Ok(path) => path,
 
             Err(error) => {
@@ -756,15 +791,26 @@ pub async fn start_job_queue(
         // This keeps diarization and Whisper word timestamps on the same audio
         // timeline and avoids a second decode/resample pass.
         let speaker_segments = if job_settings.speaker_detection {
-            match crate::speaker_diarization::run_speaker_diarization(
+            let diarization_started = Instant::now();
+            let diarization_result = crate::speaker_diarization::run_speaker_diarization(
                 app.clone(),
                 logs.clone(),
                 session.clone(),
                 &wav_path,
                 &job_settings,
             )
-            .await
+            .await;
+            let diarization_ms = diarization_started.elapsed().as_millis() as u64;
             {
+                let mut queue = queue_state
+                    .lock()
+                    .map_err(|error| format!("Queue lock error: {error}"))?;
+                if let Some(job) = queue.jobs.iter_mut().find(|job| job.id == job_id) {
+                    job.diarization_ms = Some(diarization_ms);
+                }
+            }
+
+            match diarization_result {
                 Ok(segments) => Some(segments),
                 Err(error) => {
                     // Whisper normally owns temporary WAV cleanup. If speaker
@@ -848,19 +894,31 @@ pub async fn start_job_queue(
         }
 
         // ----------------------------------------------------
-        // Existing Whisper Desktop whisper.cpp pipeline
+        // Existing whisper.cpp transcription pipeline
         // ----------------------------------------------------
 
-        match crate::transcribe::run_transcription(
+        let transcription_started = Instant::now();
+        let transcription_result = crate::transcribe::run_transcription(
             app.clone(),
             logs.clone(),
             session.clone(),
             job_settings.clone(),
             wav_path,
             duration_sec,
+            false,
         )
-        .await
+        .await;
+        let transcription_ms = transcription_started.elapsed().as_millis() as u64;
         {
+            let mut queue = queue_state
+                .lock()
+                .map_err(|error| format!("Queue lock error: {error}"))?;
+            if let Some(job) = queue.jobs.iter_mut().find(|job| job.id == job_id) {
+                job.transcription_ms = Some(transcription_ms);
+            }
+        }
+
+        match transcription_result {
             Ok(result) => {
                 {
                     let mut queue = queue_state
@@ -878,6 +936,7 @@ pub async fn start_job_queue(
                     emit_queue(&app, &queue);
                 }
 
+                let finalization_started = Instant::now();
                 let final_outputs = crate::output::finalize_transcription_outputs(
                     app.clone(),
                     logs.clone(),
@@ -888,24 +947,20 @@ pub async fn start_job_queue(
                     speaker_segments.as_deref(),
                 )
                 .await;
+                let finalization_ms = finalization_started.elapsed().as_millis() as u64;
 
                 let mut queue = queue_state
                     .lock()
                     .map_err(|error| format!("Queue lock error: {error}"))?;
 
                 if let Some(job) = queue.jobs.iter_mut().find(|job| job.id == job_id) {
+                    job.finalization_ms = Some(finalization_ms);
                     match final_outputs {
                         Ok(output_files) => {
                             job.status = JobStatus::Completed;
                             job.progress = 1.0;
-                            job.message = Some(format!(
-                                "Completed in {:.2}s",
-                                result.duration_ms as f64 / 1000.0
-                            ));
                             job.output_files = output_files;
                             job.error = None;
-                            job.duration_ms = Some(result.duration_ms);
-                            job.speed_factor = Some(result.speed_factor);
                             job.cancel_requested = false;
                         }
 
@@ -924,6 +979,17 @@ pub async fn start_job_queue(
                     }
 
                     job.completed_at_ms = Some(now_ms());
+                    if job.status == JobStatus::Completed {
+                        if let Some(total_ms) = processing_duration_ms(job) {
+                            job.duration_ms = Some(total_ms);
+                            job.speed_factor = if total_ms > 0 && job.duration_sec > 0.0 {
+                                Some((job.duration_sec * 1000.0) / total_ms as f64)
+                            } else {
+                                None
+                            };
+                            job.message = None;
+                        }
+                    }
                 }
 
                 emit_queue(&app, &queue);
@@ -960,5 +1026,46 @@ pub async fn start_job_queue(
                 }
             }
         }
-    }
+    };
+
+    let completed = final_snapshot
+        .jobs
+        .iter()
+        .filter(|job| {
+            job.status == JobStatus::Completed
+                && job.started_at_ms.is_some_and(|started| started >= queue_run_started_ms)
+        })
+        .count();
+    let failed = final_snapshot
+        .jobs
+        .iter()
+        .filter(|job| {
+            job.status == JobStatus::Failed
+                && job.started_at_ms.is_some_and(|started| started >= queue_run_started_ms)
+        })
+        .count();
+    let cancelled = final_snapshot
+        .jobs
+        .iter()
+        .filter(|job| {
+            job.status == JobStatus::Cancelled
+                && job.started_at_ms.is_some_and(|started| started >= queue_run_started_ms)
+        })
+        .count();
+
+    let body = if failed == 0 && cancelled == 0 {
+        format!("Finished {completed} file{}.", if completed == 1 { "" } else { "s" })
+    } else {
+        format!("{completed} completed • {failed} failed • {cancelled} cancelled")
+    };
+
+    let _ = app
+        .notification()
+        .builder()
+        .title("Transcriber queue finished")
+        .body(&body)
+        .show();
+    logs.log(&app, "Queue", &format!("Queue finished: {body}"));
+
+    Ok(final_snapshot)
 }

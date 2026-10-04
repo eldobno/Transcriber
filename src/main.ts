@@ -27,6 +27,10 @@ type QueueJob = {
   error: string | null;
   durationMs: number | null;
   speedFactor: number | null;
+  conversionMs: number | null;
+  diarizationMs: number | null;
+  transcriptionMs: number | null;
+  finalizationMs: number | null;
   createdAtMs: number;
   startedAtMs: number | null;
   completedAtMs: number | null;
@@ -102,10 +106,10 @@ type ModelInfo = {
 };
 
 const MODEL_CATALOG: ModelInfo[] = [
-  { name: "tiny", label: "Tiny", size: "77 MB", note: "Fastest multilingual test model" },
+  { name: "tiny", label: "Tiny", size: "77 MB", note: "Fastest multilingual model" },
   { name: "tiny-q5_1", label: "Tiny Q5", size: "32 MB", note: "Very small quantized model" },
   { name: "tiny-q8_0", label: "Tiny Q8", size: "44 MB", note: "Small quantized model" },
-  { name: "tiny.en", label: "Tiny English", size: "78 MB", note: "English-only test model" },
+  { name: "tiny.en", label: "Tiny English", size: "78 MB", note: "Fast English-only model" },
   { name: "tiny.en-q5_1", label: "Tiny English Q5", size: "32 MB", note: "English-only quantized" },
   { name: "tiny.en-q8_0", label: "Tiny English Q8", size: "44 MB", note: "English-only quantized" },
 
@@ -186,7 +190,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
     ">
       <div>
         <h1 style="margin-bottom:6px;">Transcriber</h1>
-        <p style="margin:0;">Queue + SQLite history verification</p>
+        <p style="margin:0;">Local transcription, subtitles and speaker detection</p>
       </div>
 
       <nav style="display:flex; gap:8px;">
@@ -537,7 +541,7 @@ function renderModelStatus() {
       <strong>${escapeHtml(info.label)}</strong>
       • ${escapeHtml(info.size)}
       • Installed
-      ${selectedModel === DEFAULT_MODEL ? " • Recommended for this RTX 4090 test" : ""}
+      ${selectedModel === DEFAULT_MODEL ? " • Recommended" : ""}
       <br>${escapeHtml(info.note)}
     `;
 
@@ -548,7 +552,7 @@ function renderModelStatus() {
       <strong>${escapeHtml(info.label)}</strong>
       • ${escapeHtml(info.size)}
       • Not installed
-      ${selectedModel === DEFAULT_MODEL ? " • Recommended for this RTX 4090 test" : ""}
+      ${selectedModel === DEFAULT_MODEL ? " • Recommended" : ""}
       <br>${escapeHtml(info.note)}
     `;
 
@@ -584,13 +588,14 @@ function renderSpeakerDetectionStatus() {
   }
 
   if (speakerDetectionStatus.available) {
-    speakerStatus.textContent =
-      "Ready • speakrs PLDA + VBx • speaker count: Auto";
+    speakerStatus.textContent = speakerDetectionStatus.missing.length > 0
+      ? "Ready • speaker models download automatically on first use • speaker count: Auto"
+      : "Ready • speakrs PLDA + VBx • speaker count: Auto";
     return;
   }
 
   speakerStatus.textContent =
-    `Not installed • missing: ${speakerDetectionStatus.missing.join(", ")}`;
+    `Unavailable • missing: ${speakerDetectionStatus.missing.join(", ")}`;
 }
 
 async function refreshSpeakerDetectionStatus() {
@@ -697,14 +702,9 @@ function canCancel(job: QueueJob): boolean {
 }
 
 function referenceSpeed(): number {
-  if (
-    activeMetrics &&
-    Number.isFinite(activeMetrics.speedFactor) &&
-    activeMetrics.speedFactor > 0
-  ) {
-    return activeMetrics.speedFactor;
-  }
-
+  // Queue speed is based only on completed end-to-end jobs. Whisper's live
+  // metric excludes conversion, diarization and finalization, so using it here
+  // made the displayed realtime factor and queue ETA overly optimistic.
   const completedSpeeds = queue.jobs
     .filter(
       (job) =>
@@ -872,11 +872,11 @@ function renderQueue() {
 
         const timingText =
           job.status === "transcribing" && activeMetrics
-            ? `${activeMetrics.speedFactor.toFixed(
+            ? `Whisper ${activeMetrics.speedFactor.toFixed(
                 2,
               )}× • ${formatDuration(
                 activeMetrics.etaSec,
-              )} remaining`
+              )} Whisper remaining`
             : job.status === "queued" &&
                 estimate !== null
               ? `~${formatDuration(
@@ -884,10 +884,30 @@ function renderQueue() {
                 )} estimated`
               : job.status === "completed" &&
                   job.speedFactor
-                ? `${job.speedFactor.toFixed(
+                ? `${formatDurationMs(job.durationMs)} total • ${job.speedFactor.toFixed(
                     2,
                   )}× realtime`
                 : "";
+
+        const stageTiming =
+          job.status === "completed"
+            ? [
+                job.conversionMs !== null
+                  ? `Convert ${formatDurationMs(job.conversionMs)}`
+                  : null,
+                job.diarizationMs !== null
+                  ? `Speakers ${formatDurationMs(job.diarizationMs)}`
+                  : null,
+                job.transcriptionMs !== null
+                  ? `Whisper ${formatDurationMs(job.transcriptionMs)}`
+                  : null,
+                job.finalizationMs !== null
+                  ? `Finalize ${formatDurationMs(job.finalizationMs)}`
+                  : null,
+              ]
+                .filter((value): value is string => value !== null)
+                .join(" • ")
+            : "";
 
         const outputs =
           job.outputFiles.length > 0
@@ -995,6 +1015,12 @@ function renderQueue() {
                       : ""
                   }
                 </div>
+
+                ${
+                  stageTiming
+                    ? `<div style="margin-top:6px; font-size:0.8rem; color:#888;">${escapeHtml(stageTiming)}</div>`
+                    : ""
+                }
 
                 ${outputs}
                 ${error}
@@ -1337,9 +1363,8 @@ async function initialize() {
       "load_settings",
     );
 
-  // Keep CUDA as the verification backend, but move away from tiny.en.
-  // If the user already selected a real model, preserve it. Otherwise default
-  // this stage to large-v3-turbo.
+  // Prefer CUDA when available. Preserve an existing useful model choice;
+  // otherwise default to large-v3-turbo.
   const savedModel = normalizeModelName(
     String(settings.modelPath ?? ""),
   );
@@ -1363,7 +1388,7 @@ async function initialize() {
   settings.diarize = false;
   settings.tinyDiarize = false;
   settings.speakerDetection = Boolean(settings.speakerDetection ?? false);
-  // speakrs 0.5 uses its VBx automatic speaker-count pipeline.
+  // speakrs uses its VBx automatic speaker-count pipeline.
   settings.speakerCount = 0;
   settings.speakerClusterThreshold = Number.isFinite(
     Number(settings.speakerClusterThreshold),
@@ -1438,6 +1463,13 @@ await listen<TranscribeProgress>(
       event.payload.progress ?? 0;
     activeMessage =
       event.payload.message ?? "";
+
+    // Live metrics are emitted by whisper.cpp only. Clear them while another
+    // stage is active so a previous file's Whisper RTF/ETA is never shown for
+    // conversion or Speaker Detection on the next queue item.
+    if (event.payload.stage !== "transcribing") {
+      activeMetrics = null;
+    }
 
     renderQueue();
   },

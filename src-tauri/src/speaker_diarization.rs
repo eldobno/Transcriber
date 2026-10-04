@@ -4,7 +4,10 @@ use speakrs::{ExecutionMode, ModelManager, OwnedDiarizationPipeline, Segment};
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::Instant,
 };
 use tauri::{AppHandle, Emitter};
@@ -34,6 +37,125 @@ pub struct SpeakerDetectionStatus {
 struct SessionResetGuard {
     session: Arc<Mutex<crate::TranscriptionSession>>,
 }
+
+struct CachedSpeakerPipeline {
+    mode_name: String,
+    model_dir: PathBuf,
+    pipeline: OwnedDiarizationPipeline,
+}
+
+static PIPELINE_CACHE: OnceLock<Mutex<Option<CachedSpeakerPipeline>>> = OnceLock::new();
+static CUDA_DISABLED_FOR_SESSION: AtomicBool = AtomicBool::new(false);
+
+fn pipeline_cache() -> &'static Mutex<Option<CachedSpeakerPipeline>> {
+    PIPELINE_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn clear_pipeline_cache() {
+    if let Ok(mut cache) = pipeline_cache().lock() {
+        *cache = None;
+    }
+}
+
+
+#[cfg(target_os = "windows")]
+fn file_is_on_process_path(file_name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|raw| {
+            std::env::split_paths(&raw)
+                .any(|directory| directory.join(file_name).is_file())
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn discover_windows_cudnn_bin_dir() -> Option<PathBuf> {
+    let root = PathBuf::from(r"C:\Program Files\NVIDIA\CUDNN");
+    if !root.is_dir() {
+        return None;
+    }
+
+    let preferred_cuda_version = std::env::var("CUDA_PATH")
+        .ok()
+        .and_then(|value| {
+            Path::new(&value)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.trim_start_matches('v').to_string())
+        });
+
+    let mut cudnn_versions = std::fs::read_dir(&root)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|file_type| file_type.is_dir())
+                .map(|_| entry.path())
+        })
+        .collect::<Vec<_>>();
+
+    // Prefer the newest installed cuDNN directory. The explicit CUDA-version
+    // match below matters more than lexical ordering, so this is only a tie
+    // breaker when multiple cuDNN releases are installed.
+    cudnn_versions.sort();
+    cudnn_versions.reverse();
+
+    if let Some(cuda_version) = preferred_cuda_version.as_deref() {
+        for version_dir in &cudnn_versions {
+            let candidate = version_dir
+                .join("bin")
+                .join(cuda_version)
+                .join("x64");
+            if candidate.join("cudnn64_9.dll").is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    // Fallback for machines where CUDA_PATH is absent or points at a different
+    // toolkit: accept any installed cuDNN 9 x64 runtime directory.
+    for version_dir in cudnn_versions {
+        let bin_dir = version_dir.join("bin");
+        let Ok(cuda_dirs) = std::fs::read_dir(bin_dir) else {
+            continue;
+        };
+
+        for cuda_dir in cuda_dirs.flatten() {
+            let candidate = cuda_dir.path().join("x64");
+            if candidate.join("cudnn64_9.dll").is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_windows_cudnn_on_process_path() -> Option<PathBuf> {
+    if file_is_on_process_path("cudnn64_9.dll") {
+        return None;
+    }
+
+    static CUDNN_BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let directory = CUDNN_BIN
+        .get_or_init(discover_windows_cudnn_bin_dir)
+        .clone()?;
+
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let mut entries = std::env::split_paths(&current).collect::<Vec<_>>();
+    if !entries.iter().any(|entry| entry == &directory) {
+        entries.insert(0, directory.clone());
+        if let Ok(joined) = std::env::join_paths(entries) {
+            std::env::set_var("PATH", joined);
+        }
+    }
+
+    Some(directory)
+}
+
 
 impl Drop for SessionResetGuard {
     fn drop(&mut self) {
@@ -190,6 +312,66 @@ fn convert_speakrs_segments(mut segments: Vec<Segment>) -> Vec<SpeakerSegment> {
     output
 }
 
+fn diarize_samples_with_mode(
+    samples: &[f32],
+    cache_dir: &Path,
+    mode: ExecutionMode,
+) -> Result<Vec<SpeakerSegment>, String> {
+    let mode_name = mode.as_str().to_string();
+
+    // Fast path: reuse already-loaded ONNX/CUDA sessions. The previous
+    // implementation rebuilt every session for every queue item, which made
+    // short files pay most of their time in initialization.
+    {
+        let mut cache = pipeline_cache()
+            .lock()
+            .map_err(|error| format!("Speaker pipeline cache lock failed: {error}"))?;
+        if let Some(cached) = cache.as_mut() {
+            if cached.mode_name == mode_name && cached.model_dir.starts_with(cache_dir) {
+                let result = cached.pipeline.run(samples).map_err(|error| {
+                    format!("speakrs {mode_name} Speaker Detection failed: {error}")
+                })?;
+                return Ok(convert_speakrs_segments(
+                    result.discrete_diarization.to_segments(),
+                ));
+            }
+        }
+    }
+
+    let manager = ModelManager::with_cache_dir(cache_dir.to_path_buf())
+        .map_err(|error| format!("Failed to initialize speakrs model manager: {error}"))?;
+    let model_dir = manager
+        .ensure(mode)
+        .map_err(|error| format!("Failed to prepare speakrs speaker models: {error}"))?;
+
+    let pipeline = OwnedDiarizationPipeline::from_dir(&model_dir, mode).map_err(|error| {
+        format!(
+            "Failed to initialize speakrs {mode_name} pipeline from '{}': {error}",
+            model_dir.display()
+        )
+    })?;
+
+    let mut cache = pipeline_cache()
+        .lock()
+        .map_err(|error| format!("Speaker pipeline cache lock failed: {error}"))?;
+    *cache = Some(CachedSpeakerPipeline {
+        mode_name: mode_name.clone(),
+        model_dir,
+        pipeline,
+    });
+
+    let cached = cache
+        .as_mut()
+        .ok_or_else(|| "Speaker pipeline cache was unexpectedly empty.".to_string())?;
+    let result = cached.pipeline.run(samples).map_err(|error| {
+        format!("speakrs {mode_name} Speaker Detection failed: {error}")
+    })?;
+
+    Ok(convert_speakrs_segments(
+        result.discrete_diarization.to_segments(),
+    ))
+}
+
 pub async fn run_speaker_diarization(
     app: AppHandle,
     logs: Arc<AppLogs>,
@@ -228,12 +410,13 @@ pub async fn run_speaker_diarization(
         session: session.clone(),
     };
 
-    let mode = execution_mode(settings);
-    let mode_name = mode.as_str().to_string();
+    let requested_mode = execution_mode(settings);
+    let requested_mode_name = requested_mode.as_str().to_string();
     let cache_dir = speakrs_cache_dir(&settings.models_dir);
 
     // speakrs' high-level pipeline performs automatic speaker counting via
-    // PLDA + VBx clustering. Do not fake exact count locking.
+    // PLDA + VBx clustering. Keep the public UI on Auto until the crate exposes
+    // a real exact-count constraint that we can enforce rather than simulate.
     if settings.speaker_count > 0 {
         logs.log(
             &app,
@@ -245,12 +428,18 @@ pub async fn run_speaker_diarization(
         );
     }
 
+    let effective_mode_name = if requested_mode_name.eq_ignore_ascii_case("cuda")
+        && CUDA_DISABLED_FOR_SESSION.load(Ordering::Acquire)
+    {
+        "cpu".to_string()
+    } else {
+        requested_mode_name.clone()
+    };
+
     logs.log(
         &app,
         "Speaker",
-        &format!(
-            "Starting speakrs PLDA + VBx diarization in {mode_name} mode."
-        ),
+        &format!("Starting speakrs PLDA + VBx diarization in {effective_mode_name} mode."),
     );
 
     let _ = app.emit(
@@ -264,8 +453,11 @@ pub async fn run_speaker_diarization(
     );
 
     let worker_app = app.clone();
+    let worker_logs = logs.clone();
     let worker_wav = wav_path.clone();
     let started = Instant::now();
+    let prefer_cuda = requested_mode_name.eq_ignore_ascii_case("cuda")
+        && !CUDA_DISABLED_FOR_SESSION.load(Ordering::Acquire);
 
     let segments = tokio::task::spawn_blocking(move || -> Result<Vec<SpeakerSegment>, String> {
         let samples = read_pcm16_mono_16khz(&worker_wav)?;
@@ -287,44 +479,88 @@ pub async fn run_speaker_diarization(
             },
         );
 
-        // ModelManager::with_cache_dir + ensure(mode) downloads the exact model
-        // inventory required by the selected execution mode and returns its snapshot dir.
-        let manager = ModelManager::with_cache_dir(cache_dir.clone()).map_err(|error| {
-            format!("Failed to initialize speakrs model manager: {error}")
-        })?;
+        #[cfg(target_os = "windows")]
+        if prefer_cuda {
+            if let Some(cudnn_dir) = ensure_windows_cudnn_on_process_path() {
+                worker_logs.log(
+                    &worker_app,
+                    "Speaker",
+                    &format!(
+                        "Found installed cuDNN 9 and added it to this app session: {}",
+                        cudnn_dir.display()
+                    ),
+                );
+            }
+        }
 
-        let model_dir = manager.ensure(mode).map_err(|error| {
-            format!("Failed to prepare speakrs speaker models: {error}")
-        })?;
+        let primary_mode = if prefer_cuda {
+            ExecutionMode::Cuda
+        } else {
+            ExecutionMode::Cpu
+        };
 
         let _ = worker_app.emit(
             "transcribe-status",
             TranscribeProgress {
                 progress: 0.18,
-                message: "Detecting speakers with PLDA + VBx...".to_string(),
+                message: if prefer_cuda {
+                    "Detecting speakers with CUDA + PLDA/VBx...".to_string()
+                } else {
+                    "Detecting speakers with CPU + PLDA/VBx...".to_string()
+                },
                 active: true,
                 stage: Some("diarizing".to_string()),
             },
         );
 
-        let mut pipeline = OwnedDiarizationPipeline::from_dir(&model_dir, mode).map_err(|error| {
-            format!(
-                "Failed to initialize speakrs {mode_name} pipeline from '{}': {error}",
-                model_dir.display()
-            )
-        })?;
+        let mut converted = match diarize_samples_with_mode(&samples, &cache_dir, primary_mode) {
+            Ok(segments) => segments,
+            Err(cuda_error) if prefer_cuda => {
+                CUDA_DISABLED_FOR_SESSION.store(true, Ordering::Release);
+                clear_pipeline_cache();
 
-        let result = pipeline.run(&samples).map_err(|error| {
-            format!("speakrs Speaker Detection failed: {error}")
-        })?;
+                worker_logs.log(
+                    &worker_app,
+                    "Speaker",
+                    &format!(
+                        "CUDA Speaker Detection failed; falling back to CPU for this app session: {cuda_error}"
+                    ),
+                );
+                let _ = worker_app.emit(
+                    "transcribe-status",
+                    TranscribeProgress {
+                        progress: 0.18,
+                        message: "CUDA Speaker Detection unavailable — retrying on CPU..."
+                            .to_string(),
+                        active: true,
+                        stage: Some("diarizing".to_string()),
+                    },
+                );
 
-        let converted = convert_speakrs_segments(result.discrete_diarization.to_segments());
+                diarize_samples_with_mode(&samples, &cache_dir, ExecutionMode::Cpu).map_err(
+                    |cpu_error| {
+                        format!(
+                            "Speaker Detection failed on CUDA and CPU. CUDA: {cuda_error} | CPU: {cpu_error}"
+                        )
+                    },
+                )?
+            }
+            Err(error) => return Err(error),
+        };
 
         if converted.is_empty() {
             return Err(
                 "Speaker Detection completed but returned no speaker segments.".to_string(),
             );
         }
+
+        // Keep segment ordering deterministic even if an upstream backend emits
+        // equivalent ranges in a different order.
+        converted.sort_by(|left, right| {
+            left.start_sec
+                .total_cmp(&right.start_sec)
+                .then_with(|| left.end_sec.total_cmp(&right.end_sec))
+        });
 
         Ok(converted)
     })

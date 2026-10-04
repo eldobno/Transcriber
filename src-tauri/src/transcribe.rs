@@ -377,6 +377,7 @@ pub async fn run_transcription(
     settings: WhisperSettings,
     wav_path: String,
     mut duration_sec: f64,
+    notify: bool,
 ) -> Result<TranscriptionResult, String> {
     {
         let mut lock = session
@@ -403,12 +404,13 @@ pub async fn run_transcription(
         .to_string_lossy()
         .to_string();
 
-    // Trigger OS-level notification
-    send_notification(
-        &app,
-        "Transcription Started",
-        &format!("Processing {}...", file_name),
-    );
+    if notify {
+        send_notification(
+            &app,
+            "Transcription Started",
+            &format!("Processing {}...", file_name),
+        );
+    }
 
     let root = Path::new(&settings.models_dir);
     let backend_name = settings.selected_backend.to_lowercase();
@@ -1046,11 +1048,13 @@ pub async fn run_transcription(
                     stage: Some("aborted".to_string()),
                 },
             );
-            send_notification(
-                &app,
-                "Transcription Cancelled",
-                &format!("Whisper process cancelled for {}!", file_name),
-            );
+            if notify {
+                send_notification(
+                    &app,
+                    "Transcription Cancelled",
+                    &format!("Whisper process cancelled for {}!", file_name),
+                );
+            }
             return Err("Whisper process was cancelled by the user.".to_string());
         } else {
             let _ = app.emit(
@@ -1062,11 +1066,13 @@ pub async fn run_transcription(
                     stage: Some("failed".to_string()),
                 },
             );
-            send_notification(
-                &app,
-                "Transcription Failed",
-                &format!("Whisper process terminated for {}!", file_name),
-            );
+            if notify {
+                send_notification(
+                    &app,
+                    "Transcription Failed",
+                    &format!("Whisper process terminated for {}!", file_name),
+                );
+            }
 
             let detailed_err = format_cli_exit_error(
                 &settings.selected_backend,
@@ -1121,12 +1127,13 @@ pub async fn run_transcription(
 
     logs.log(&app, "Whisper", "Transcription completed successfully!");
 
-    // Emitting OS notification
-    send_notification(
-        &app,
-        "Transcription Complete",
-        &format!("Successfully processed {}!", file_name),
-    );
+    if notify {
+        send_notification(
+            &app,
+            "Transcription Complete",
+            &format!("Successfully processed {}!", file_name),
+        );
+    }
 
     let _ = app.emit(
         "transcribe-status",

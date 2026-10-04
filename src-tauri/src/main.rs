@@ -11,6 +11,7 @@ mod logger;
 mod job_queue;
 mod media_preview;
 mod output;
+mod power;
 mod settings;
 mod speaker_diarization;
 mod subtitle;
@@ -149,7 +150,7 @@ async fn start_transcription_task(
 ) -> Result<TranscriptionResult, String> {
     let logs = log_state.0.clone();
     let session = session_state.0.clone();
-    run_transcription(app, logs, session, settings, wav_path, duration_sec).await
+    run_transcription(app, logs, session, settings, wav_path, duration_sec, true).await
 }
 
 pub(crate) async fn cancel_transcription_session(
@@ -1146,7 +1147,7 @@ fn main() {
             };
 
             let show_item =
-                MenuItem::with_id(_app, "show", "Open Whisper Desktop", true, None::<&str>)?;
+                MenuItem::with_id(_app, "show", "Open Transcriber", true, None::<&str>)?;
             let quit_item =
                 MenuItem::with_id(_app, "quit", "Quit Application", true, None::<&str>)?;
             let tray_menu = Menu::with_items(_app, &[&show_item, &quit_item])?;
@@ -1154,7 +1155,7 @@ fn main() {
             if let Some(icon) = _app.default_window_icon() {
                 let _tray = TrayIconBuilder::new()
                     .icon(icon.clone())
-                    .tooltip("Whisper Desktop")
+                    .tooltip("Transcriber")
                     .menu(&tray_menu)
                     .show_menu_on_left_click(false)
                     .on_menu_event(|app, event| match event.id.as_ref() {
@@ -1200,7 +1201,7 @@ fn main() {
             if let Some(window) = _app.get_webview_window("main") {
                 let event_window = window.clone();
 
-                window.as_ref().on_webview_event(move |event| {
+                window.on_webview_event(move |event| {
                     let tauri::WebviewEvent::DragDrop(event) = event else {
                         return;
                     };

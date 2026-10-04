@@ -11,14 +11,14 @@ name = "transcriber_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "=2.7.1", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png"] }
-tauri-plugin-opener = "2"
-tauri-plugin-dialog = "2"
-tauri-plugin-notification = "2"
-tauri-plugin-clipboard-manager = "2"
+tauri = { version = "=2.12.1", features = ["protocol-asset", "tray-icon", "image-png"] }
+tauri-plugin-opener = "=2.7.0"
+tauri-plugin-dialog = "=2.8.1"
+tauri-plugin-notification = "=2.5.1"
+tauri-plugin-clipboard-manager = "=2.4.1"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -43,11 +43,13 @@ sha2 = "0.10"
 keyring = "2.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 hound = "3.5"
-# Temporary upstream pin: the published 0.5.0 CUDA model loader can try to
-# open split-tail assets that its own ModelManager does not download.
-# Upstream master is 0.6.0 and uses an asset inventory/execution plan that
-# only loads model files which are actually present for the selected backend.
-speakrs = { git = "https://github.com/avencera/speakrs.git", branch = "master", features = ["cuda"] }
+# Pin the tested upstream 0.6.0 commit. Published 0.5.0 could request a split-tail
+# ONNX asset its ModelManager did not provision; this revision contains the fixed
+# asset-inventory loader used by the validated CUDA diarization path.
+speakrs = { git = "https://github.com/avencera/speakrs.git", rev = "ab98f358420aa0bc238326631359dd5b351f74b2", features = ["cuda"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
 
 [profile.release]
 lto = true

@@ -60,14 +60,16 @@ pub struct WhisperSettings {
     pub translate: bool,
     pub diarize: bool,
     pub tiny_diarize: bool,
-    /// Transcriber speaker clustering (sherpa-onnx). Separate from whisper.cpp's
+    /// Native speakrs PLDA + VBx Speaker Detection. Separate from whisper.cpp's
     /// legacy stereo diarization and TinyDiarize speaker-turn tokens.
     #[serde(default)]
     pub speaker_detection: bool,
-    /// 0 = automatic speaker count; positive values lock clustering to that count.
+    /// 0 = automatic speaker count. Positive values are retained only for
+    /// backward-compatible settings files; speakrs currently runs Auto.
     #[serde(default)]
     pub speaker_count: i32,
-    /// Used only when speaker_count == 0. sherpa-onnx reference default is 0.5.
+    /// Legacy sherpa-era setting kept for backward-compatible settings files.
+    /// It is not exposed or consumed by the current speakrs pipeline.
     #[serde(default = "default_speaker_cluster_threshold", deserialize_with = "deserialize_f64_lenient")]
     pub speaker_cluster_threshold: f64,
     pub no_fallback: bool,
@@ -400,13 +402,13 @@ fn sanitize_recent_list(raw: &[String], lowercase: bool) -> Vec<String> {
 }
 
 /// Resolves the default models directory cross-platform.
-/// Defaults to `<HOME>/whisper-desktop/models`.
+/// Defaults to `<HOME>/transcriber/models`.
 /// For backward compatibility:
-/// 1. If `<HOME>/whisper-desktop/models` exists, uses it.
-/// 2. If `<HOME>/whisper-desktop` (flat) exists, preserves it.
+/// 1. If `<HOME>/transcriber/models` exists, uses it.
+/// 2. If `<HOME>/transcriber` (flat) exists, preserves it.
 /// 3. If legacy `<HOME>/whisper.cpp/models` exists, falls back to it.
 /// 4. If legacy `<HOME>/whisper.cpp` exists, falls back to it.
-/// 5. Otherwise, defaults to `<HOME>/whisper-desktop/models`.
+/// 5. Otherwise, defaults to `<HOME>/transcriber/models`.
 pub fn resolve_default_models_dir() -> PathBuf {
     let home = get_user_home_dir();
     let modern = home.join("transcriber").join("models");
@@ -595,6 +597,16 @@ pub fn load_settings_from_path(path: &Path) -> WhisperSettings {
 }
 
 pub fn atomic_replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    // Never replace a directory with a settings file. Apart from being unsafe,
+    // Windows can successfully rename the directory out of the way and make an
+    // otherwise-invalid save appear to succeed.
+    if to.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to replace directory '{}'", to.display()),
+        ));
+    }
+
     #[cfg(not(windows))]
     {
         fs::rename(from, to)
@@ -604,24 +616,33 @@ pub fn atomic_replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
         if fs::rename(from, to).is_ok() {
             return Ok(());
         }
-        let backup_path = to.with_extension(format!("bak.{}", std::process::id()));
-        let _ = fs::remove_file(&backup_path);
 
-        let mut backoff = std::time::Duration::from_millis(15);
-        for _ in 0..5 {
-            if fs::rename(to, &backup_path).is_ok() {
-                let move_res = fs::rename(from, to);
-                if move_res.is_err() {
-                    let _ = fs::rename(&backup_path, to);
-                    return move_res;
+        // Windows cannot atomically rename over an existing file in the same
+        // way Unix can. Move the current file aside, move the staged file into
+        // place, then delete the backup. This also gives antivirus/file-lock
+        // races a few short retries without ever clobbering a directory.
+        if to.exists() {
+            let backup_path = to.with_extension(format!("bak.{}", std::process::id()));
+            let _ = fs::remove_file(&backup_path);
+
+            let mut backoff = std::time::Duration::from_millis(15);
+            for _ in 0..5 {
+                if fs::rename(to, &backup_path).is_ok() {
+                    let move_res = fs::rename(from, to);
+                    if move_res.is_err() {
+                        let _ = fs::rename(&backup_path, to);
+                        return move_res;
+                    }
+                    let _ = fs::remove_file(&backup_path);
+                    return Ok(());
                 }
-                let _ = fs::remove_file(&backup_path);
-                return Ok(());
+                std::thread::sleep(backoff);
+                backoff *= 2;
             }
-            std::thread::sleep(backoff);
-            backoff *= 2;
         }
-        // Fallback if renaming is blocked by AV / file locks
+
+        // Final fallback if the destination did not exist or renames are
+        // blocked by an external process.
         fs::copy(from, to)?;
         let _ = fs::remove_file(from);
         Ok(())
@@ -962,11 +983,12 @@ mod tests {
     }
 
     #[test]
-    fn settings_path_ends_with_whisper_desktop_settings_json() {
+    fn settings_path_ends_with_transcriber_settings_json() {
         let path = get_settings_path();
         let path_str = path.to_string_lossy();
         assert!(path_str.ends_with("settings.json"));
-        assert!(path_str.contains("whisper-desktop"));
+        assert!(path_str.contains("transcriber"));
+        assert!(!path_str.contains("whisper-desktop"));
         assert!(!path_str.contains("whisper-manager-desktop"));
 
         let home = get_user_home_dir();
