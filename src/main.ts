@@ -149,24 +149,28 @@ const MODEL_CATALOG: ModelInfo[] = [
 
 const DEFAULT_MODEL = "large-v3-turbo";
 
+const LANGUAGE_OPTIONS = [
+  ["auto", "Auto detect"],
+  ["en", "English"],
+  ["es", "Spanish"],
+  ["fr", "French"],
+  ["de", "German"],
+  ["it", "Italian"],
+  ["pt", "Portuguese"],
+  ["nl", "Dutch"],
+  ["pl", "Polish"],
+  ["ru", "Russian"],
+  ["uk", "Ukrainian"],
+  ["tr", "Turkish"],
+  ["ar", "Arabic"],
+  ["hi", "Hindi"],
+  ["ja", "Japanese"],
+  ["ko", "Korean"],
+  ["zh", "Chinese"],
+] as const;
+
 type WhisperSettings = Record<string, any>;
-
-let settings: WhisperSettings | null = null;
-
-let queue: QueueSnapshot = {
-  jobs: [],
-  running: false,
-  totalDurationSec: 0,
-};
-
-let historyEntries: HistoryEntry[] = [];
-let activeProgress = 0;
-let activeMessage = "";
-let activeMetrics: TranscribeMetrics | null = null;
-let activeView: "convert" | "history" = "convert";
-let selectedModel = DEFAULT_MODEL;
-let installedModels = new Set<string>();
-let modelDownload: ModelDownloadProgress | null = null;
+type AppView = "convert" | "history" | "settings";
 
 type SpeakerDetectionStatus = {
   available: boolean;
@@ -176,285 +180,303 @@ type SpeakerDetectionStatus = {
   missing: string[];
 };
 
+let settings: WhisperSettings | null = null;
+let queue: QueueSnapshot = { jobs: [], running: false, totalDurationSec: 0 };
+let historyEntries: HistoryEntry[] = [];
+let activeProgress = 0;
+let activeMessage = "";
+let activeMetrics: TranscribeMetrics | null = null;
+let activeView: AppView = "convert";
+let selectedModel = DEFAULT_MODEL;
+let installedModels = new Set<string>();
+let modelDownload: ModelDownloadProgress | null = null;
 let speakerDetectionStatus: SpeakerDetectionStatus | null = null;
 let speakerDetectionStatusError: string | null = null;
+let historyQuery = "";
 
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
-  <main>
-    <div style="
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      gap:24px;
-      margin-bottom:28px;
-    ">
-      <div>
-        <h1 style="margin-bottom:6px;">Transcriber</h1>
-        <p style="margin:0;">Local transcription, subtitles and speaker detection</p>
-      </div>
-
-      <nav style="display:flex; gap:8px;">
-        <button id="nav-convert">Convert</button>
-        <button id="nav-history">History</button>
-      </nav>
-    </div>
-
-    <section id="convert-view">
-      <div id="model-panel" style="
-        padding:16px;
-        border:1px solid #444;
-        border-radius:8px;
-        background:#242424;
-        margin-bottom:18px;
-      ">
-        <div style="
-          display:flex;
-          align-items:flex-end;
-          gap:12px;
-          flex-wrap:wrap;
-        ">
-          <label style="display:flex; flex-direction:column; gap:6px; min-width:300px;">
-            <span style="font-size:0.9rem; color:#b8b8b8;">Transcription model</span>
-            <select id="model-select" style="
-              font:inherit;
-              padding:10px 12px;
-              border-radius:8px;
-              border:1px solid #454545;
-              background:#171717;
-              color:inherit;
-            "></select>
-          </label>
-
-          <button id="download-model">Download Model</button>
-        </div>
-
-        <div id="model-status" style="
-          margin-top:10px;
-          color:#b8b8b8;
-          font-size:0.9rem;
-          line-height:1.5;
-        "></div>
-      </div>
-
-      <div id="speaker-panel" style="
-        padding:16px;
-        border:1px solid #444;
-        border-radius:8px;
-        background:#242424;
-        margin-bottom:18px;
-      ">
-        <div style="display:flex; align-items:center; gap:14px; flex-wrap:wrap;">
-          <label style="display:flex; align-items:center; gap:9px; cursor:pointer;">
-            <input id="speaker-detection" type="checkbox">
-            <strong>Speaker Detection</strong>
-            <span style="font-size:0.78rem; color:#aaa;">Beta</span>
-          </label>
-
-          <label style="display:flex; align-items:center; gap:8px;">
-            <span style="font-size:0.9rem; color:#b8b8b8;">Speakers</span>
-            <select id="speaker-count" style="
-              font:inherit;
-              padding:7px 10px;
-              border-radius:7px;
-              border:1px solid #454545;
-              background:#171717;
-              color:inherit;
-            ">
-              <option value="0">Auto (VBx)</option>
-            </select>
-          </label>
-        </div>
-
-        <div id="speaker-status" style="
-          margin-top:10px;
-          color:#b8b8b8;
-          font-size:0.9rem;
-          line-height:1.5;
-        "></div>
-      </div>
-
-      <div id="drop-zone" style="
-        display:flex;
-        align-items:center;
-        justify-content:space-between;
-        gap:18px;
-        padding:20px;
-        margin-bottom:14px;
-        border:1px dashed #5b5b5b;
-        border-radius:10px;
-        background:#202020;
-        cursor:pointer;
-        transition:border-color 120ms ease, background 120ms ease;
-      ">
+  <main class="app-shell">
+    <header class="app-header">
+      <div class="brand-block">
+        <div class="brand-mark">T</div>
         <div>
-          <div style="font-weight:600;">Drop files or folders here</div>
-          <div style="margin-top:4px; color:#999; font-size:0.9rem;">
-            Audio and video files are added automatically. Folders are scanned recursively.
+          <div class="brand-row">
+            <h1>Transcriber</h1>
+            <span class="local-badge">LOCAL</span>
           </div>
-        </div>
-        <div style="color:#888; font-size:0.85rem; white-space:nowrap;">
-          Click to browse
+          <p>Fast private transcription, subtitles and speaker detection.</p>
         </div>
       </div>
 
-      <div style="
-        display:flex;
-        gap:10px;
-        flex-wrap:wrap;
-        margin-bottom:24px;
-      ">
-        <button id="add-files">Add Files</button>
-        <button id="add-folder">Add Folder</button>
-        <button id="start-queue" disabled>Start Queue</button>
-        <button id="clear-queue">Clear</button>
+      <nav class="tabs" aria-label="Main navigation">
+        <button id="nav-convert" class="tab active" type="button">Convert</button>
+        <button id="nav-history" class="tab" type="button">History</button>
+        <button id="nav-settings" class="tab" type="button">Settings</button>
+      </nav>
+    </header>
+
+    <section id="convert-view" class="view">
+      <div class="quick-settings-grid">
+        <label class="control-card">
+          <span class="control-label">Model</span>
+          <select id="model-select" class="control-select"></select>
+          <span id="model-status" class="control-help"></span>
+        </label>
+
+        <label class="control-card">
+          <span class="control-label">Language</span>
+          <select id="language-select" class="control-select"></select>
+          <span class="control-help">Auto works well for mixed queues.</span>
+        </label>
+
+        <div class="control-card">
+          <div class="switch-row">
+            <div>
+              <span class="control-label">Speaker Detection</span>
+              <span class="beta-badge">BETA</span>
+            </div>
+            <label class="switch">
+              <input id="speaker-detection" type="checkbox">
+              <span class="switch-track"></span>
+            </label>
+          </div>
+          <span id="speaker-status" class="control-help"></span>
+        </div>
+      </div>
+
+      <section id="drop-zone" class="drop-zone" role="button" tabindex="0" aria-label="Add audio or video files">
+        <div class="drop-icon">＋</div>
+        <div class="drop-copy">
+          <strong>Drop files or folders here</strong>
+          <span>Audio and video are detected automatically. Folders are scanned recursively.</span>
+        </div>
+        <button id="browse-files" class="button secondary" type="button">Browse files</button>
+      </section>
+
+      <div class="action-bar">
+        <div class="action-group">
+          <button id="add-files" class="button secondary" type="button">Add Files</button>
+          <button id="add-folder" class="button secondary" type="button">Add Folder</button>
+        </div>
+        <div class="action-group">
+          <button id="clear-queue" class="button ghost" type="button">Clear</button>
+          <button id="start-queue" class="button primary" type="button" disabled>Start Queue</button>
+        </div>
+      </div>
+
+      <div class="policy-note">
+        <span class="status-dot"></span>
+        <span><strong>Automatic V1 output:</strong> audio → TXT · video → subtitled MKV · speaker labels only when 2+ speakers are detected.</span>
       </div>
 
       <div id="queue-summary"></div>
-      <div id="jobs"></div>
+      <div id="jobs" class="stack"></div>
     </section>
 
-    <section id="history-view" hidden>
-      <div style="
-        display:flex;
-        gap:12px;
-        flex-wrap:wrap;
-        margin-bottom:24px;
-      ">
-        <button id="refresh-history">Refresh History</button>
-        <button id="clear-history">Clear History</button>
+    <section id="history-view" class="view" hidden>
+      <div class="section-toolbar">
+        <div>
+          <h2>History</h2>
+          <p>Recent completed, cancelled and failed jobs.</p>
+        </div>
+        <div class="toolbar-actions">
+          <button id="refresh-history" class="button secondary" type="button">Refresh</button>
+          <button id="clear-history" class="button ghost danger" type="button">Clear History</button>
+        </div>
       </div>
 
+      <label class="search-box">
+        <span>⌕</span>
+        <input id="history-search" type="search" placeholder="Search filenames, paths or outputs">
+      </label>
+
       <div id="history-summary"></div>
-      <div id="history-list"></div>
+      <div id="history-list" class="stack"></div>
     </section>
 
-    <div id="toast" hidden style="
-      position:fixed;
-      right:24px;
-      bottom:24px;
-      max-width:360px;
-      padding:11px 14px;
-      border:1px solid #4b4b4b;
-      border-radius:9px;
-      background:#292929;
-      box-shadow:0 12px 32px rgba(0,0,0,.28);
-      font-size:0.9rem;
-      z-index:1000;
-    "></div>
+    <section id="settings-view" class="view" hidden>
+      <div class="section-toolbar">
+        <div>
+          <h2>Settings</h2>
+          <p>Keep the common choices simple. Advanced transcription tuning stays automatic for V1.</p>
+        </div>
+      </div>
+
+      <div class="settings-grid">
+        <section class="settings-card">
+          <div class="settings-card-heading">
+            <div>
+              <h3>Transcription</h3>
+              <p>Default model, backend and spoken language.</p>
+            </div>
+          </div>
+
+          <label class="field">
+            <span>Model</span>
+            <select id="settings-model-select"></select>
+          </label>
+          <div id="settings-model-status" class="field-help"></div>
+          <button id="settings-download-model" class="button secondary compact" type="button">Download Model</button>
+
+          <label class="field">
+            <span>Backend</span>
+            <select id="backend-select">
+              <option value="CUDA">NVIDIA CUDA</option>
+              <option value="Standard">CPU</option>
+            </select>
+          </label>
+          <div class="field-help">CUDA is recommended on NVIDIA systems. Speaker Detection falls back to CPU if its CUDA runtime cannot start.</div>
+
+          <label class="field">
+            <span>Default language</span>
+            <select id="settings-language-select"></select>
+          </label>
+        </section>
+
+        <section class="settings-card">
+          <div class="settings-card-heading">
+            <div>
+              <h3>Speaker Detection</h3>
+              <p>Native speakrs PLDA + VBx diarization.</p>
+            </div>
+            <label class="switch">
+              <input id="settings-speaker-detection" type="checkbox">
+              <span class="switch-track"></span>
+            </label>
+          </div>
+          <div id="settings-speaker-status" class="field-help"></div>
+          <div class="settings-fact"><span>Speaker count</span><strong>Auto</strong></div>
+          <div class="settings-fact"><span>Single-speaker files</span><strong>No labels</strong></div>
+          <div class="settings-fact"><span>Multi-speaker files</span><strong>Speaker 1 / Speaker 2 / …</strong></div>
+        </section>
+
+        <section class="settings-card">
+          <div class="settings-card-heading">
+            <div>
+              <h3>Output</h3>
+              <p>Choose where finished files are written.</p>
+            </div>
+          </div>
+
+          <label class="field">
+            <span>Save outputs</span>
+            <select id="output-mode-select">
+              <option value="input_dir">Next to the source file</option>
+              <option value="custom">Custom folder</option>
+            </select>
+          </label>
+
+          <div id="custom-output-row" class="output-path-row">
+            <input id="output-path" type="text" readonly placeholder="Choose a folder">
+            <button id="choose-output-folder" class="button secondary compact" type="button">Choose</button>
+          </div>
+          <div id="output-status" class="field-help">Audio exports as TXT. Video exports as a soft-subtitle MKV without re-encoding.</div>
+        </section>
+
+        <section class="settings-card">
+          <div class="settings-card-heading">
+            <div>
+              <h3>App</h3>
+              <p>Appearance and queue behaviour.</p>
+            </div>
+          </div>
+
+          <label class="field">
+            <span>Theme</span>
+            <select id="theme-select">
+              <option value="carbon">Carbon</option>
+              <option value="royal-blue">Royal Blue</option>
+              <option value="emerald">Emerald</option>
+              <option value="fire-orange">Fire Orange</option>
+            </select>
+          </label>
+
+          <div class="settings-fact"><span>Keep PC awake while queue runs</span><strong>Enabled</strong></div>
+          <div class="settings-fact"><span>Queue completion notification</span><strong>Enabled</strong></div>
+          <div class="settings-fact"><span>Processing</span><strong>Local only</strong></div>
+        </section>
+      </div>
+    </section>
+
+    <div id="toast" class="toast" hidden></div>
   </main>
 `;
 
-const convertView =
-  document.querySelector<HTMLElement>("#convert-view")!;
-const historyView =
-  document.querySelector<HTMLElement>("#history-view")!;
+const $ = <T extends Element>(selector: string) => document.querySelector<T>(selector)!;
 
-const convertNav =
-  document.querySelector<HTMLButtonElement>("#nav-convert")!;
-const historyNav =
-  document.querySelector<HTMLButtonElement>("#nav-history")!;
-
-const queueSummary =
-  document.querySelector<HTMLDivElement>("#queue-summary")!;
-const jobsContainer =
-  document.querySelector<HTMLDivElement>("#jobs")!;
-
-const historySummary =
-  document.querySelector<HTMLDivElement>("#history-summary")!;
-const historyContainer =
-  document.querySelector<HTMLDivElement>("#history-list")!;
-
-const addButton =
-  document.querySelector<HTMLButtonElement>("#add-files")!;
-const addFolderButton =
-  document.querySelector<HTMLButtonElement>("#add-folder")!;
-const dropZone =
-  document.querySelector<HTMLDivElement>("#drop-zone")!;
-const toast =
-  document.querySelector<HTMLDivElement>("#toast")!;
-const startButton =
-  document.querySelector<HTMLButtonElement>("#start-queue")!;
-const clearQueueButton =
-  document.querySelector<HTMLButtonElement>("#clear-queue")!;
-
-const modelSelect =
-  document.querySelector<HTMLSelectElement>("#model-select")!;
-const downloadModelButton =
-  document.querySelector<HTMLButtonElement>("#download-model")!;
-const modelStatus =
-  document.querySelector<HTMLDivElement>("#model-status")!;
-
-const speakerDetectionCheckbox =
-  document.querySelector<HTMLInputElement>("#speaker-detection")!;
-const speakerCountSelect =
-  document.querySelector<HTMLSelectElement>("#speaker-count")!;
-const speakerStatus =
-  document.querySelector<HTMLDivElement>("#speaker-status")!;
-
-const refreshHistoryButton =
-  document.querySelector<HTMLButtonElement>("#refresh-history")!;
-const clearHistoryButton =
-  document.querySelector<HTMLButtonElement>("#clear-history")!;
+const convertView = $("#convert-view") as HTMLElement;
+const historyView = $("#history-view") as HTMLElement;
+const settingsView = $("#settings-view") as HTMLElement;
+const convertNav = $("#nav-convert") as HTMLButtonElement;
+const historyNav = $("#nav-history") as HTMLButtonElement;
+const settingsNav = $("#nav-settings") as HTMLButtonElement;
+const queueSummary = $("#queue-summary") as HTMLDivElement;
+const jobsContainer = $("#jobs") as HTMLDivElement;
+const historySummary = $("#history-summary") as HTMLDivElement;
+const historyContainer = $("#history-list") as HTMLDivElement;
+const addButton = $("#add-files") as HTMLButtonElement;
+const browseFilesButton = $("#browse-files") as HTMLButtonElement;
+const addFolderButton = $("#add-folder") as HTMLButtonElement;
+const dropZone = $("#drop-zone") as HTMLDivElement;
+const toast = $("#toast") as HTMLDivElement;
+const startButton = $("#start-queue") as HTMLButtonElement;
+const clearQueueButton = $("#clear-queue") as HTMLButtonElement;
+const modelSelect = $("#model-select") as HTMLSelectElement;
+const settingsModelSelect = $("#settings-model-select") as HTMLSelectElement;
+const settingsDownloadModelButton = $("#settings-download-model") as HTMLButtonElement;
+const modelStatus = $("#model-status") as HTMLSpanElement;
+const settingsModelStatus = $("#settings-model-status") as HTMLDivElement;
+const languageSelect = $("#language-select") as HTMLSelectElement;
+const settingsLanguageSelect = $("#settings-language-select") as HTMLSelectElement;
+const speakerDetectionCheckbox = $("#speaker-detection") as HTMLInputElement;
+const settingsSpeakerDetectionCheckbox = $("#settings-speaker-detection") as HTMLInputElement;
+const speakerStatus = $("#speaker-status") as HTMLSpanElement;
+const settingsSpeakerStatus = $("#settings-speaker-status") as HTMLDivElement;
+const refreshHistoryButton = $("#refresh-history") as HTMLButtonElement;
+const clearHistoryButton = $("#clear-history") as HTMLButtonElement;
+const historySearch = $("#history-search") as HTMLInputElement;
+const backendSelect = $("#backend-select") as HTMLSelectElement;
+const outputModeSelect = $("#output-mode-select") as HTMLSelectElement;
+const customOutputRow = $("#custom-output-row") as HTMLDivElement;
+const outputPathInput = $("#output-path") as HTMLInputElement;
+const chooseOutputFolderButton = $("#choose-output-folder") as HTMLButtonElement;
+const outputStatus = $("#output-status") as HTMLDivElement;
+const themeSelect = $("#theme-select") as HTMLSelectElement;
 
 function escapeHtml(value: string): string {
   return value
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
+    .replace(/\"/g, "&quot;")
     .replace(/'/g, "&#039;");
 }
 
 function formatDuration(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds < 0) {
-    return "—";
-  }
-
+  if (!Number.isFinite(seconds) || seconds < 0) return "—";
   const rounded = Math.max(0, Math.round(seconds));
   const hours = Math.floor(rounded / 3600);
   const minutes = Math.floor((rounded % 3600) / 60);
   const secs = rounded % 60;
-
-  if (hours > 0) {
-    return `${hours}:${String(minutes).padStart(2, "0")}:${String(
-      secs,
-    ).padStart(2, "0")}`;
-  }
-
-  return `${minutes}:${String(secs).padStart(2, "0")}`;
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`
+    : `${minutes}:${String(secs).padStart(2, "0")}`;
 }
 
 function formatDurationMs(value: number | null): string {
-  if (value === null) {
-    return "—";
-  }
-
-  if (value < 1000) {
-    return `${value} ms`;
-  }
-
+  if (value === null) return "—";
+  if (value < 1000) return `${Math.round(value)} ms`;
   return `${(value / 1000).toFixed(2)} s`;
 }
 
 function formatDate(value: number | null): string {
-  if (value === null) {
-    return "—";
-  }
-
-  return new Date(value).toLocaleString();
+  return value === null ? "—" : new Date(value).toLocaleString();
 }
 
 function normalizeModelName(value: string): string {
   let name = value.trim().toLowerCase().replace(/\\/g, "/").split("/").pop() ?? value;
-
-  if (name.startsWith("ggml-")) {
-    name = name.slice(5);
-  }
-
-  if (name.endsWith(".bin")) {
-    name = name.slice(0, -4);
-  }
-
+  if (name.startsWith("ggml-")) name = name.slice(5);
+  if (name.endsWith(".bin")) name = name.slice(0, -4);
   return name;
 }
 
@@ -463,234 +485,200 @@ function modelFileName(name: string): string {
 }
 
 function selectedModelInfo(): ModelInfo {
-  return (
-    MODEL_CATALOG.find((model) => model.name === selectedModel) ??
-    MODEL_CATALOG.find((model) => model.name === DEFAULT_MODEL)!
-  );
+  return MODEL_CATALOG.find((model) => model.name === selectedModel)
+    ?? MODEL_CATALOG.find((model) => model.name === DEFAULT_MODEL)!;
+}
+
+function renderLanguageOptions() {
+  const html = LANGUAGE_OPTIONS.map(([value, label]) => `<option value="${value}">${label}</option>`).join("");
+  languageSelect.innerHTML = html;
+  settingsLanguageSelect.innerHTML = html;
+  const language = String(settings?.language ?? "auto");
+  languageSelect.value = LANGUAGE_OPTIONS.some(([value]) => value === language) ? language : "auto";
+  settingsLanguageSelect.value = languageSelect.value;
 }
 
 function renderModelOptions() {
-  modelSelect.innerHTML = MODEL_CATALOG.map((model) => {
-    const recommended =
-      model.name === DEFAULT_MODEL ? " — Recommended" : "";
-
-    return `
-      <option value="${escapeHtml(model.name)}">
-        ${escapeHtml(model.label)} • ${escapeHtml(model.size)}${recommended}
-      </option>
-    `;
+  const html = MODEL_CATALOG.map((model) => {
+    const installed = installedModels.has(model.name) ? " ✓" : "";
+    const recommended = model.name === DEFAULT_MODEL ? " · Recommended" : "";
+    return `<option value="${escapeHtml(model.name)}">${escapeHtml(model.label)} · ${escapeHtml(model.size)}${recommended}${installed}</option>`;
   }).join("");
-
+  modelSelect.innerHTML = html;
+  settingsModelSelect.innerHTML = html;
   modelSelect.value = selectedModel;
+  settingsModelSelect.value = selectedModel;
 }
 
 function renderModelStatus() {
   const info = selectedModelInfo();
   const installed = installedModels.has(selectedModel);
-  const downloading =
-    modelDownload?.modelName === selectedModel &&
-    (modelDownload.phase === "starting" ||
-      modelDownload.phase === "downloading" ||
-      modelDownload.phase === "paused");
+  const downloading = modelDownload?.modelName === selectedModel
+    && ["starting", "downloading", "paused"].includes(modelDownload.phase);
+
+  let text = `${info.label} · ${info.size}`;
+  let buttonText = installed ? "Installed" : "Download Model";
+  let buttonDisabled = installed || queue.running;
 
   if (downloading && modelDownload) {
     const percent = Math.round(modelDownload.progress * 100);
-    const downloadedMb =
-      (modelDownload.downloadedBytes / 1024 / 1024).toFixed(0);
-    const totalMb =
-      modelDownload.totalBytes > 0
-        ? (modelDownload.totalBytes / 1024 / 1024).toFixed(0)
-        : "?";
-    const speedMbps =
-      modelDownload.speedBps > 0
-        ? ((modelDownload.speedBps * 8) / 1_000_000).toFixed(1)
-        : "…";
-
-    modelStatus.innerHTML = `
-      <strong>${escapeHtml(info.label)}</strong>
-      • ${escapeHtml(info.size)}
-      • Downloading ${percent}% (${downloadedMb}/${totalMb} MB, ${speedMbps} Mbps)
-    `;
-
-    downloadModelButton.textContent = "Downloading…";
-    downloadModelButton.disabled = true;
-    modelSelect.disabled = true;
-    return;
-  }
-
-  if (
-    modelDownload?.modelName === selectedModel &&
-    modelDownload.phase === "failed"
-  ) {
-    modelStatus.innerHTML = `
-      <strong>${escapeHtml(info.label)}</strong>
-      • ${escapeHtml(info.size)}
-      • Download failed: ${escapeHtml(modelDownload.error ?? "Unknown error")}
-    `;
-
-    downloadModelButton.textContent = "Retry Download";
-    downloadModelButton.disabled = false;
-    modelSelect.disabled = false;
-    return;
-  }
-
-  modelSelect.disabled = queue.running;
-
-  if (installed) {
-    modelStatus.innerHTML = `
-      <strong>${escapeHtml(info.label)}</strong>
-      • ${escapeHtml(info.size)}
-      • Installed
-      ${selectedModel === DEFAULT_MODEL ? " • Recommended" : ""}
-      <br>${escapeHtml(info.note)}
-    `;
-
-    downloadModelButton.textContent = "Installed";
-    downloadModelButton.disabled = true;
+    text = `${info.label} · Downloading ${percent}%`;
+    buttonText = "Downloading…";
+    buttonDisabled = true;
+  } else if (modelDownload?.modelName === selectedModel && modelDownload.phase === "failed") {
+    text = `Download failed · ${modelDownload.error ?? "Unknown error"}`;
+    buttonText = "Retry Download";
+    buttonDisabled = false;
+  } else if (installed) {
+    text += selectedModel === DEFAULT_MODEL ? " · Installed · Recommended" : " · Installed";
   } else {
-    modelStatus.innerHTML = `
-      <strong>${escapeHtml(info.label)}</strong>
-      • ${escapeHtml(info.size)}
-      • Not installed
-      ${selectedModel === DEFAULT_MODEL ? " • Recommended" : ""}
-      <br>${escapeHtml(info.note)}
-    `;
-
-    downloadModelButton.textContent = "Download Model";
-    downloadModelButton.disabled = queue.running;
+    text += " · Not installed";
   }
+
+  modelStatus.textContent = text;
+  settingsModelStatus.textContent = `${text}. ${info.note}`;
+  settingsDownloadModelButton.textContent = buttonText;
+  settingsDownloadModelButton.disabled = buttonDisabled;
+  modelSelect.disabled = queue.running || downloading;
+  settingsModelSelect.disabled = queue.running || downloading;
+}
+
+function speakerStatusText(): string {
+  if (!settings?.speakerDetection) return "Off · enable for multi-speaker transcripts.";
+  if (speakerDetectionStatusError) return `Status unavailable · ${speakerDetectionStatusError}`;
+  if (!speakerDetectionStatus) return "Checking local speaker runtime…";
+  if (speakerDetectionStatus.available) {
+    return speakerDetectionStatus.missing.length > 0
+      ? "Ready · models download automatically on first use."
+      : "Ready · automatic speaker count.";
+  }
+  return `Unavailable · missing ${speakerDetectionStatus.missing.join(", ")}`;
 }
 
 function renderSpeakerDetectionStatus() {
   if (!settings) return;
-
   const enabled = Boolean(settings.speakerDetection);
   speakerDetectionCheckbox.checked = enabled;
-  speakerCountSelect.value = "0";
-  speakerCountSelect.disabled = true;
+  settingsSpeakerDetectionCheckbox.checked = enabled;
   speakerDetectionCheckbox.disabled = queue.running;
+  settingsSpeakerDetectionCheckbox.disabled = queue.running;
+  const text = speakerStatusText();
+  speakerStatus.textContent = text;
+  settingsSpeakerStatus.textContent = text;
+}
 
-  if (!enabled) {
-    speakerStatus.textContent =
-      "Off. Enable for Speaker 1 / Speaker 2 clustering in the transcript.";
-    return;
-  }
+function applyTheme() {
+  const theme = String(settings?.theme ?? "carbon");
+  document.documentElement.dataset.theme = theme;
+  themeSelect.value = ["carbon", "royal-blue", "emerald", "fire-orange"].includes(theme)
+    ? theme
+    : "carbon";
+}
 
-  if (speakerDetectionStatusError) {
-    speakerStatus.textContent =
-      `Status check unavailable • ${speakerDetectionStatusError}`;
-    return;
-  }
+function renderSettings() {
+  if (!settings) return;
+  backendSelect.value = settings.selectedBackend === "Standard" ? "Standard" : "CUDA";
+  outputModeSelect.value = settings.outputDirMode === "custom" ? "custom" : "input_dir";
+  outputPathInput.value = String(settings.outputDirPath ?? "");
+  customOutputRow.hidden = outputModeSelect.value !== "custom";
+  outputStatus.textContent = outputModeSelect.value === "custom"
+    ? (outputPathInput.value ? `Outputs will be written to ${outputPathInput.value}` : "Choose a writable output folder.")
+    : "Outputs are written next to each source file.";
+  renderLanguageOptions();
+  renderModelOptions();
+  renderModelStatus();
+  renderSpeakerDetectionStatus();
+  applyTheme();
+}
 
-  if (!speakerDetectionStatus) {
-    speakerStatus.textContent = "Checking local speaker-detection runtime…";
-    return;
-  }
-
-  if (speakerDetectionStatus.available) {
-    speakerStatus.textContent = speakerDetectionStatus.missing.length > 0
-      ? "Ready • speaker models download automatically on first use • speaker count: Auto"
-      : "Ready • speakrs PLDA + VBx • speaker count: Auto";
-    return;
-  }
-
-  speakerStatus.textContent =
-    `Unavailable • missing: ${speakerDetectionStatus.missing.join(", ")}`;
+async function persistSettings() {
+  if (!settings) return;
+  await invoke("save_settings", { settings });
 }
 
 async function refreshSpeakerDetectionStatus() {
   if (!settings) return;
-
   try {
-    speakerDetectionStatus =
-      await invoke<SpeakerDetectionStatus>(
-        "get_speaker_detection_status",
-        { modelsDir: settings.modelsDir },
-      );
+    speakerDetectionStatus = await invoke<SpeakerDetectionStatus>("get_speaker_detection_status", {
+      modelsDir: settings.modelsDir,
+    });
     speakerDetectionStatusError = null;
   } catch (error) {
     speakerDetectionStatus = null;
     speakerDetectionStatusError = String(error);
-    renderSpeakerDetectionStatus();
-    return;
   }
-
   renderSpeakerDetectionStatus();
-  renderQueue();
 }
 
 async function refreshInstalledModels() {
   if (!settings) return;
-
-  const scan = await invoke<ModelScanResult>(
-    "scan_models",
-    {
-      modelsDir: settings.modelsDir,
-      backend: "CUDA",
-    },
-  );
-
-  installedModels = new Set(
-    scan.transModels.map(normalizeModelName),
-  );
-
+  const scan = await invoke<ModelScanResult>("scan_models", {
+    modelsDir: settings.modelsDir,
+    backend: settings.selectedBackend === "Standard" ? "Standard" : "CUDA",
+  });
+  installedModels = new Set(scan.transModels.map(normalizeModelName));
+  renderModelOptions();
   renderModelStatus();
 }
 
-async function applySelectedModel() {
+async function applySelectedModel(name: string) {
   if (!settings) return;
-
-  settings.selectedBackend = "CUDA";
+  selectedModel = name;
   settings.modelPath = modelFileName(selectedModel);
-
-  await invoke("save_settings", { settings });
+  modelDownload = null;
+  await persistSettings();
+  renderModelOptions();
   renderModelStatus();
   renderQueue();
 }
 
+async function applyLanguage(language: string) {
+  if (!settings) return;
+  settings.language = language;
+  await persistSettings();
+  renderLanguageOptions();
+}
+
+async function setSpeakerDetection(enabled: boolean) {
+  if (!settings) return;
+  settings.speakerDetection = enabled;
+  settings.speakerCount = 0;
+  await persistSettings();
+  await refreshSpeakerDetectionStatus();
+  renderQueue();
+}
+
 function statusLabel(status: string): string {
-  switch (status) {
-    case "inspecting":
-      return "Inspecting";
-    case "ready":
-      return "Ready";
-    case "queued":
-      return "Queued";
-    case "converting":
-      return "Converting";
-    case "transcribing":
-      return "Transcribing";
-    case "finalizing":
-      return "Finalizing";
-    case "completed":
-      return "Completed";
-    case "failed":
-      return "Failed";
-    case "cancelled":
-      return "Cancelled";
-    case "interrupted":
-      return "Interrupted";
-    case "running":
-      return "Running";
-    default:
-      return status;
-  }
+  const labels: Record<string, string> = {
+    inspecting: "Inspecting",
+    ready: "Ready",
+    queued: "Queued",
+    converting: "Converting",
+    transcribing: "Transcribing",
+    finalizing: "Finalizing",
+    completed: "Completed",
+    failed: "Failed",
+    cancelled: "Cancelled",
+    interrupted: "Interrupted",
+    running: "Running",
+  };
+  return labels[status] ?? status;
+}
+
+function statusClass(status: string): string {
+  if (status === "completed") return "success";
+  if (status === "failed") return "error";
+  if (status === "cancelled" || status === "interrupted") return "muted";
+  if (["converting", "transcribing", "finalizing"].includes(status)) return "active";
+  return "neutral";
 }
 
 function isPending(job: QueueJob): boolean {
-  return (
-    job.status === "inspecting" ||
-    job.status === "ready" ||
-    job.status === "queued"
-  );
+  return ["inspecting", "ready", "queued"].includes(job.status);
 }
 
 function isActive(job: QueueJob): boolean {
-  return (
-    job.status === "converting" ||
-    job.status === "transcribing" ||
-    job.status === "finalizing"
-  );
+  return ["converting", "transcribing", "finalizing"].includes(job.status);
 }
 
 function canMove(job: QueueJob): boolean {
@@ -702,591 +690,187 @@ function canCancel(job: QueueJob): boolean {
 }
 
 function referenceSpeed(): number {
-  // Queue speed is based only on completed end-to-end jobs. Whisper's live
-  // metric excludes conversion, diarization and finalization, so using it here
-  // made the displayed realtime factor and queue ETA overly optimistic.
-  const completedSpeeds = queue.jobs
-    .filter(
-      (job) =>
-        job.status === "completed" &&
-        job.speedFactor !== null &&
-        Number.isFinite(job.speedFactor) &&
-        (job.speedFactor ?? 0) > 0 &&
-        job.durationSec >= 5,
-    )
+  const speeds = queue.jobs
+    .filter((job) => job.status === "completed" && job.speedFactor && job.speedFactor > 0 && job.durationSec >= 5)
     .map((job) => job.speedFactor as number);
-
-  if (completedSpeeds.length === 0) {
-    return 0;
-  }
-
-  return (
-    completedSpeeds.reduce((sum, speed) => sum + speed, 0) /
-    completedSpeeds.length
-  );
+  return speeds.length ? speeds.reduce((sum, value) => sum + value, 0) / speeds.length : 0;
 }
 
-function estimatedJobSeconds(
-  job: QueueJob,
-  speed: number,
-): number | null {
-  if (
-    job.status === "completed" ||
-    job.status === "failed" ||
-    job.status === "cancelled"
-  ) {
-    return 0;
-  }
-
-  if (
-    (job.status === "converting" ||
-      job.status === "transcribing") &&
-    activeMetrics
-  ) {
+function estimatedJobSeconds(job: QueueJob, speed: number): number | null {
+  if (["completed", "failed", "cancelled"].includes(job.status)) return 0;
+  if (["converting", "transcribing"].includes(job.status) && activeMetrics) {
     return Math.max(0, activeMetrics.etaSec);
   }
-
-  if (speed > 0 && job.durationSec > 0) {
-    return job.durationSec / speed;
-  }
-
-  return null;
+  return speed > 0 && job.durationSec > 0 ? job.durationSec / speed : null;
 }
 
 function queueEtaSeconds(): number | null {
   const speed = referenceSpeed();
   let total = 0;
   let hasEstimate = false;
-
   for (const job of queue.jobs) {
     const estimate = estimatedJobSeconds(job, speed);
-
     if (estimate !== null) {
       total += estimate;
-
-      if (
-        job.status !== "completed" &&
-        job.status !== "failed" &&
-        job.status !== "cancelled"
-      ) {
-        hasEstimate = true;
-      }
+      if (!["completed", "failed", "cancelled"].includes(job.status)) hasEstimate = true;
     }
   }
-
   return hasEstimate ? total : 0;
 }
 
 function renderQueue() {
-  const completed = queue.jobs.filter(
-    (job) => job.status === "completed",
-  ).length;
-
-  const failed = queue.jobs.filter(
-    (job) => job.status === "failed",
-  ).length;
-
-  const cancelled = queue.jobs.filter(
-    (job) => job.status === "cancelled",
-  ).length;
-
+  const completed = queue.jobs.filter((job) => job.status === "completed").length;
+  const failed = queue.jobs.filter((job) => job.status === "failed").length;
+  const cancelled = queue.jobs.filter((job) => job.status === "cancelled").length;
   const speed = referenceSpeed();
-  const queueEta = queueEtaSeconds();
+  const eta = queueEtaSeconds();
 
-  queueSummary.innerHTML = `
-    <div style="
-      padding:14px 16px;
-      border:1px solid #444;
-      border-radius:8px;
-      background:#242424;
-      line-height:1.6;
-      margin-bottom:18px;
-    ">
-      <strong>${queue.running ? "QUEUE RUNNING" : "QUEUE IDLE"}</strong><br>
-      Files: ${queue.jobs.length}
-      &nbsp;•&nbsp;
-      Duration: ${formatDuration(queue.totalDurationSec)}
-      &nbsp;•&nbsp;
-      Completed: ${completed}
-      &nbsp;•&nbsp;
-      Failed: ${failed}
-      &nbsp;•&nbsp;
-      Cancelled: ${cancelled}
-      ${
-        queue.running
-          ? `<br>
-             Speed: ${
-               speed > 0
-                 ? `${speed.toFixed(2)}× realtime`
-                 : "measuring…"
-             }
-             &nbsp;•&nbsp;
-             Queue remaining: ${
-               queueEta !== null
-                 ? formatDuration(queueEta)
-                 : "measuring…"
-             }`
-          : ""
-      }
-    </div>
-  `;
+  queueSummary.innerHTML = queue.jobs.length === 0 ? "" : `
+    <section class="summary-card">
+      <div class="summary-primary">
+        <span class="summary-state ${queue.running ? "running" : "idle"}">${queue.running ? "Queue running" : "Queue ready"}</span>
+        <strong>${queue.jobs.length} ${queue.jobs.length === 1 ? "file" : "files"}</strong>
+        <span>${formatDuration(queue.totalDurationSec)} media</span>
+      </div>
+      <div class="summary-stats">
+        <span>${completed} done</span>
+        ${failed ? `<span class="text-error">${failed} failed</span>` : ""}
+        ${cancelled ? `<span>${cancelled} cancelled</span>` : ""}
+        ${queue.running ? `<span>${speed > 0 ? `${speed.toFixed(2)}× realtime` : "measuring speed"}</span><span>${eta !== null ? `${formatDuration(eta)} remaining` : "measuring ETA"}</span>` : ""}
+      </div>
+    </section>`;
 
   if (queue.jobs.length === 0) {
-    jobsContainer.innerHTML = `
-      <div style="
-        padding:24px;
-        border:1px solid #444;
-        border-radius:8px;
-        background:#242424;
-      ">
-        No files yet. Add a few short audio/video files.
-      </div>
-    `;
+    jobsContainer.innerHTML = `<div class="empty-state"><strong>Your queue is empty.</strong><span>Drop media above or add a folder to start.</span></div>`;
   } else {
-    jobsContainer.innerHTML = queue.jobs
-      .map((job, index) => {
-        const active = isActive(job);
-
-        const progress =
-          active && job.status === "transcribing"
-            ? Math.round(activeProgress * 100)
-            : job.status === "completed"
-              ? 100
-              : 0;
-
-        const progressText =
-          active && job.status === "transcribing"
-            ? `${progress}%`
+    jobsContainer.innerHTML = queue.jobs.map((job, index) => {
+      const active = isActive(job);
+      const progress = active && job.status === "transcribing"
+        ? Math.round(activeProgress * 100)
+        : job.status === "completed" ? 100 : active ? 8 : 0;
+      const detailMessage = activeMessage && active ? activeMessage : job.message ?? "";
+      const estimate = estimatedJobSeconds(job, referenceSpeed());
+      const timingText = job.status === "transcribing" && activeMetrics
+        ? `Whisper ${activeMetrics.speedFactor.toFixed(2)}× · ${formatDuration(activeMetrics.etaSec)} remaining`
+        : job.status === "queued" && estimate !== null
+          ? `~${formatDuration(estimate)} estimated`
+          : job.status === "completed" && job.speedFactor
+            ? `${formatDurationMs(job.durationMs)} · ${job.speedFactor.toFixed(2)}× realtime`
             : "";
+      const stageTiming = job.status === "completed"
+        ? [
+            job.conversionMs !== null ? `Convert ${formatDurationMs(job.conversionMs)}` : null,
+            job.diarizationMs !== null ? `Speakers ${formatDurationMs(job.diarizationMs)}` : null,
+            job.transcriptionMs !== null ? `Whisper ${formatDurationMs(job.transcriptionMs)}` : null,
+            job.finalizationMs !== null ? `Finalize ${formatDurationMs(job.finalizationMs)}` : null,
+          ].filter((value): value is string => value !== null).join(" · ")
+        : "";
+      const outputs = job.outputFiles.length
+        ? `<div class="output-list">${job.outputFiles.map((file) => `<span>${escapeHtml(file)}</span>`).join("")}</div>`
+        : "";
+      const error = job.error ? `<div class="error-box">${escapeHtml(job.error)}</div>` : "";
 
-        const detailMessage =
-          activeMessage && job.status === "transcribing"
-            ? activeMessage
-            : job.message ?? "";
-
-        const speedForEstimate = referenceSpeed();
-        const estimate = estimatedJobSeconds(
-          job,
-          speedForEstimate,
-        );
-
-        const timingText =
-          job.status === "transcribing" && activeMetrics
-            ? `Whisper ${activeMetrics.speedFactor.toFixed(
-                2,
-              )}× • ${formatDuration(
-                activeMetrics.etaSec,
-              )} Whisper remaining`
-            : job.status === "queued" &&
-                estimate !== null
-              ? `~${formatDuration(
-                  estimate,
-                )} estimated`
-              : job.status === "completed" &&
-                  job.speedFactor
-                ? `${formatDurationMs(job.durationMs)} total • ${job.speedFactor.toFixed(
-                    2,
-                  )}× realtime`
-                : "";
-
-        const stageTiming =
-          job.status === "completed"
-            ? [
-                job.conversionMs !== null
-                  ? `Convert ${formatDurationMs(job.conversionMs)}`
-                  : null,
-                job.diarizationMs !== null
-                  ? `Speakers ${formatDurationMs(job.diarizationMs)}`
-                  : null,
-                job.transcriptionMs !== null
-                  ? `Whisper ${formatDurationMs(job.transcriptionMs)}`
-                  : null,
-                job.finalizationMs !== null
-                  ? `Finalize ${formatDurationMs(job.finalizationMs)}`
-                  : null,
-              ]
-                .filter((value): value is string => value !== null)
-                .join(" • ")
-            : "";
-
-        const outputs =
-          job.outputFiles.length > 0
-            ? `
-              <div style="margin-top:10px; font-size:0.9rem;">
-                <strong>Output</strong><br>
-                ${job.outputFiles
-                  .map(
-                    (file) =>
-                      `${escapeHtml(file)}<br>`,
-                  )
-                  .join("")}
-              </div>
-            `
-            : "";
-
-        const error =
-          job.error
-            ? `
-              <div style="margin-top:10px;">
-                <strong>Error:</strong>
-                ${escapeHtml(job.error)}
-              </div>
-            `
-            : "";
-
-        const upDisabled =
-          !canMove(job) || index === 0
-            ? "disabled"
-            : "";
-
-        const downDisabled =
-          !canMove(job) ||
-          index === queue.jobs.length - 1
-            ? "disabled"
-            : "";
-
-        const cancelDisabled =
-          !canCancel(job) ? "disabled" : "";
-
-        return `
-          <section style="
-            margin-bottom:12px;
-            padding:16px;
-            border:1px solid #444;
-            border-radius:8px;
-            background:#242424;
-          ">
-            <div style="
-              display:flex;
-              justify-content:space-between;
-              align-items:flex-start;
-              gap:16px;
-            ">
-              <div style="min-width:0; flex:1;">
-                <div style="font-weight:600;">
-                  ${index + 1}. ${escapeHtml(
-                    job.fileName,
-                  )}
-                </div>
-
-                <div style="
-                  margin-top:6px;
-                  font-size:0.9rem;
-                  color:#b8b8b8;
-                ">
-                  ${statusLabel(job.status)}
-                  ${
-                    progressText
-                      ? ` • ${progressText}`
-                      : ""
-                  }
-                  ${
-                    timingText
-                      ? ` • ${escapeHtml(
-                          timingText,
-                        )}`
-                      : ""
-                  }
-                  ${
-                    detailMessage
-                      ? ` • ${escapeHtml(
-                          detailMessage,
-                        )}`
-                      : ""
-                  }
-                </div>
-
-                <div style="
-                  margin-top:6px;
-                  font-size:0.85rem;
-                  color:#999;
-                ">
-                  ${escapeHtml(job.format || "Unknown")}
-                  ${
-                    job.size
-                      ? ` • ${escapeHtml(job.size)}`
-                      : ""
-                  }
-                  ${
-                    job.durationSec > 0
-                      ? ` • ${formatDuration(
-                          job.durationSec,
-                        )}`
-                      : ""
-                  }
-                </div>
-
-                ${
-                  stageTiming
-                    ? `<div style="margin-top:6px; font-size:0.8rem; color:#888;">${escapeHtml(stageTiming)}</div>`
-                    : ""
-                }
-
-                ${outputs}
-                ${error}
-              </div>
-
-              <div style="
-                display:flex;
-                gap:8px;
-                flex-wrap:wrap;
-                justify-content:flex-end;
-              ">
-                <button
-                  data-action="up"
-                  data-job-id="${escapeHtml(job.id)}"
-                  ${upDisabled}
-                  title="Move up"
-                >
-                  ↑
-                </button>
-
-                <button
-                  data-action="down"
-                  data-job-id="${escapeHtml(job.id)}"
-                  ${downDisabled}
-                  title="Move down"
-                >
-                  ↓
-                </button>
-
-                <button
-                  data-action="cancel"
-                  data-job-id="${escapeHtml(job.id)}"
-                  ${cancelDisabled}
-                >
-                  ${active ? "Cancel Active" : "Cancel"}
-                </button>
-              </div>
+      return `
+        <article class="job-card ${active ? "is-active" : ""}">
+          <div class="job-index">${index + 1}</div>
+          <div class="job-main">
+            <div class="job-title-row">
+              <strong class="job-title">${escapeHtml(job.fileName)}</strong>
+              <span class="status-chip ${statusClass(job.status)}">${statusLabel(job.status)}</span>
             </div>
-          </section>
-        `;
-      })
-      .join("");
+            <div class="job-meta">${escapeHtml(job.format || "Media")} ${job.size ? `· ${escapeHtml(job.size)}` : ""} ${job.durationSec > 0 ? `· ${formatDuration(job.durationSec)}` : ""}</div>
+            ${timingText || detailMessage ? `<div class="job-detail">${escapeHtml([timingText, detailMessage].filter(Boolean).join(" · "))}</div>` : ""}
+            ${stageTiming ? `<div class="stage-timing">${escapeHtml(stageTiming)}</div>` : ""}
+            ${active ? `<div class="progress-track"><span style="width:${Math.max(3, progress)}%"></span></div>` : ""}
+            ${outputs}
+            ${error}
+          </div>
+          <div class="job-actions">
+            <button class="icon-button" data-action="up" data-job-id="${escapeHtml(job.id)}" ${!canMove(job) || index === 0 ? "disabled" : ""} title="Move up">↑</button>
+            <button class="icon-button" data-action="down" data-job-id="${escapeHtml(job.id)}" ${!canMove(job) || index === queue.jobs.length - 1 ? "disabled" : ""} title="Move down">↓</button>
+            <button class="button ghost compact" data-action="cancel" data-job-id="${escapeHtml(job.id)}" ${!canCancel(job) ? "disabled" : ""}>${active ? "Cancel" : "Remove"}</button>
+          </div>
+        </article>`;
+    }).join("");
   }
 
-  const hasRunnableJobs = queue.jobs.some(
-    (job) =>
-      job.status === "ready" ||
-      job.status === "queued",
-  );
-
-  const selectedInstalled =
-    installedModels.has(selectedModel);
-
-  // Do not make the entire queue button dead just because the optional
-  // frontend status probe is unavailable. The backend validates the actual
-  // diarization runtime/models when the job starts and returns a concrete
-  // per-job error if something is missing.
-  startButton.disabled =
-    queue.running ||
-    !hasRunnableJobs ||
-    !selectedInstalled;
-
+  const hasRunnableJobs = queue.jobs.some((job) => job.status === "ready" || job.status === "queued");
+  startButton.disabled = queue.running || !hasRunnableJobs || !installedModels.has(selectedModel);
   addButton.disabled = queue.running;
+  browseFilesButton.disabled = queue.running;
   addFolderButton.disabled = queue.running;
-  dropZone.style.pointerEvents = queue.running ? "none" : "auto";
-  dropZone.style.opacity = queue.running ? "0.55" : "1";
-  clearQueueButton.disabled = queue.running;
-
+  clearQueueButton.disabled = queue.running || queue.jobs.length === 0;
+  dropZone.classList.toggle("disabled", queue.running);
   renderModelStatus();
   renderSpeakerDetectionStatus();
 }
 
+function filteredHistory(): HistoryEntry[] {
+  const needle = historyQuery.trim().toLowerCase();
+  if (!needle) return historyEntries;
+  return historyEntries.filter((entry) => [
+    entry.fileName,
+    entry.sourcePath,
+    entry.model,
+    entry.backend,
+    ...entry.outputFiles,
+  ].some((value) => value.toLowerCase().includes(needle)));
+}
+
 function renderHistory() {
-  const completed = historyEntries.filter(
-    (entry) => entry.status === "completed",
-  ).length;
-
-  const failed = historyEntries.filter(
-    (entry) => entry.status === "failed",
-  ).length;
-
-  const cancelled = historyEntries.filter(
-    (entry) => entry.status === "cancelled",
-  ).length;
-
-  const interrupted = historyEntries.filter(
-    (entry) => entry.status === "interrupted",
-  ).length;
+  const filtered = filteredHistory();
+  const completed = historyEntries.filter((entry) => entry.status === "completed").length;
+  const failed = historyEntries.filter((entry) => entry.status === "failed").length;
 
   historySummary.innerHTML = `
-    <div style="
-      padding:14px 16px;
-      border:1px solid #444;
-      border-radius:8px;
-      background:#242424;
-      line-height:1.6;
-      margin-bottom:18px;
-    ">
-      <strong>HISTORY</strong><br>
-      Records: ${historyEntries.length}
-      &nbsp;•&nbsp;
-      Completed: ${completed}
-      &nbsp;•&nbsp;
-      Failed: ${failed}
-      &nbsp;•&nbsp;
-      Cancelled: ${cancelled}
-      &nbsp;•&nbsp;
-      Interrupted: ${interrupted}
-    </div>
-  `;
+    <section class="summary-card">
+      <div class="summary-primary"><strong>${historyEntries.length} records</strong><span>${completed} completed</span>${failed ? `<span class="text-error">${failed} failed</span>` : ""}</div>
+      ${historyQuery ? `<div class="summary-stats"><span>${filtered.length} matching search</span></div>` : ""}
+    </section>`;
 
-  if (historyEntries.length === 0) {
-    historyContainer.innerHTML = `
-      <div style="
-        padding:24px;
-        border:1px solid #444;
-        border-radius:8px;
-        background:#242424;
-      ">
-        No history records yet.
-        Run or cancel a few queue jobs in Convert.
-      </div>
-    `;
+  if (filtered.length === 0) {
+    historyContainer.innerHTML = `<div class="empty-state"><strong>${historyEntries.length ? "No matching history." : "No history yet."}</strong><span>${historyEntries.length ? "Try a different search." : "Finished jobs will appear here."}</span></div>`;
     return;
   }
 
-  historyContainer.innerHTML = historyEntries
-    .map((entry, index) => {
-      const outputs =
-        entry.outputFiles.length > 0
-          ? `
-            <div style="margin-top:10px;">
-              <strong>Outputs</strong><br>
-              ${entry.outputFiles
-                .map(
-                  (file) =>
-                    `${escapeHtml(file)}<br>`,
-                )
-                .join("")}
-            </div>
-          `
-          : "";
-
-      const error =
-        entry.error
-          ? `
-            <div style="margin-top:10px;">
-              <strong>Error</strong><br>
-              ${escapeHtml(entry.error)}
-            </div>
-          `
-          : "";
-
-      return `
-        <section style="
-          margin-bottom:12px;
-          padding:16px;
-          border:1px solid #444;
-          border-radius:8px;
-          background:#242424;
-        ">
-          <div style="
-            display:flex;
-            justify-content:space-between;
-            gap:16px;
-            align-items:flex-start;
-          ">
-            <div style="min-width:0; flex:1;">
-              <div style="font-weight:600;">
-                ${index + 1}. ${escapeHtml(
-                  entry.fileName,
-                )}
-              </div>
-
-              <div style="
-                margin-top:6px;
-                color:#b8b8b8;
-              ">
-                ${escapeHtml(
-                  statusLabel(entry.status),
-                )}
-                ${
-                  entry.speedFactor !== null
-                    ? ` • ${entry.speedFactor.toFixed(
-                        2,
-                      )}× realtime`
-                    : ""
-                }
-                ${
-                  entry.processingDurationMs !== null
-                    ? ` • ${formatDurationMs(
-                        entry.processingDurationMs,
-                      )}`
-                    : ""
-                }
-              </div>
-
-              <div style="
-                margin-top:6px;
-                color:#999;
-                font-size:0.9rem;
-              ">
-                Media: ${formatDuration(
-                  entry.mediaDurationSec,
-                )}
-                • Backend: ${escapeHtml(
-                  entry.backend || "—",
-                )}
-                • Model: ${escapeHtml(
-                  entry.model || "—",
-                )}
-              </div>
-
-              <div style="
-                margin-top:6px;
-                color:#999;
-                font-size:0.9rem;
-                overflow-wrap:anywhere;
-              ">
-                ${escapeHtml(entry.sourcePath)}
-              </div>
-
-              <div style="
-                margin-top:6px;
-                color:#999;
-                font-size:0.85rem;
-              ">
-                Created: ${formatDate(
-                  entry.createdAtMs,
-                )}<br>
-                Started: ${formatDate(
-                  entry.startedAtMs,
-                )}<br>
-                Finished: ${formatDate(
-                  entry.completedAtMs,
-                )}
-              </div>
-
-              ${outputs}
-              ${error}
-            </div>
-
-            <button
-              data-delete-history-id="${escapeHtml(
-                entry.id,
-              )}"
-            >
-              Delete
-            </button>
+  historyContainer.innerHTML = filtered.map((entry) => {
+    const outputs = entry.outputFiles.length
+      ? `<div class="history-outputs"><span>Outputs</span>${entry.outputFiles.map((file) => `<code>${escapeHtml(file)}</code>`).join("")}</div>`
+      : "";
+    const error = entry.error ? `<div class="error-box">${escapeHtml(entry.error)}</div>` : "";
+    return `
+      <article class="history-card">
+        <div class="history-main">
+          <div class="job-title-row">
+            <strong class="job-title">${escapeHtml(entry.fileName)}</strong>
+            <span class="status-chip ${statusClass(entry.status)}">${statusLabel(entry.status)}</span>
           </div>
-        </section>
-      `;
-    })
-    .join("");
+          <div class="history-performance">
+            ${entry.speedFactor !== null ? `<strong>${entry.speedFactor.toFixed(2)}× realtime</strong>` : ""}
+            ${entry.processingDurationMs !== null ? `<span>${formatDurationMs(entry.processingDurationMs)}</span>` : ""}
+            <span>${formatDuration(entry.mediaDurationSec)} media</span>
+          </div>
+          <div class="job-meta">${escapeHtml(entry.backend || "—")} · ${escapeHtml(entry.model || "—")}</div>
+          <div class="path-text">${escapeHtml(entry.sourcePath)}</div>
+          <details class="history-details">
+            <summary>Details</summary>
+            <div>Created ${formatDate(entry.createdAtMs)}</div>
+            <div>Started ${formatDate(entry.startedAtMs)}</div>
+            <div>Finished ${formatDate(entry.completedAtMs)}</div>
+          </details>
+          ${outputs}
+          ${error}
+        </div>
+        <button class="button ghost compact danger" data-delete-history-id="${escapeHtml(entry.id)}">Delete</button>
+      </article>`;
+  }).join("");
 }
 
 let toastTimer: number | null = null;
-
 function showToast(message: string) {
   toast.textContent = message;
   toast.hidden = false;
-
-  if (toastTimer !== null) {
-    window.clearTimeout(toastTimer);
-  }
-
+  if (toastTimer !== null) window.clearTimeout(toastTimer);
   toastTimer = window.setTimeout(() => {
     toast.hidden = true;
     toastTimer = null;
@@ -1294,524 +878,295 @@ function showToast(message: string) {
 }
 
 async function addPathsToQueue(paths: string[]) {
-  if (paths.length === 0) {
-    return;
-  }
-
+  if (!paths.length) return;
   try {
-    const result =
-      await invoke<AddJobsResult>(
-        "add_job_queue_files",
-        { paths },
-      );
-
+    const result = await invoke<AddJobsResult>("add_job_queue_files", { paths });
     queue = result.queue;
     renderQueue();
-
-    if (result.ignoredPaths.length > 0) {
+    if (result.ignoredPaths.length) {
       const count = result.ignoredPaths.length;
-      showToast(
-        `${count} unsupported ${count === 1 ? "item was" : "items were"} skipped.`,
-      );
+      showToast(`${count} unsupported ${count === 1 ? "item" : "items"} skipped.`);
     }
   } catch (error) {
-    queueSummary.textContent =
-      `Adding files failed: ${String(error)}`;
+    showToast(`Adding files failed: ${String(error)}`);
   }
 }
 
 async function refreshQueue() {
-  queue =
-    await invoke<QueueSnapshot>("get_job_queue");
+  queue = await invoke<QueueSnapshot>("get_job_queue");
   renderQueue();
 }
 
 async function loadHistory() {
   try {
-    historyEntries =
-      await invoke<HistoryEntry[]>(
-        "get_history_entries",
-        {
-          limit: 100,
-          offset: 0,
-        },
-      );
-
+    historyEntries = await invoke<HistoryEntry[]>("get_history_entries", { limit: 100, offset: 0 });
     renderHistory();
   } catch (error) {
-    historySummary.textContent =
-      `History load failed: ${String(error)}`;
+    historySummary.innerHTML = `<div class="error-box">History load failed: ${escapeHtml(String(error))}</div>`;
   }
 }
 
-async function showView(
-  view: "convert" | "history",
-) {
+async function showView(view: AppView) {
   activeView = view;
-
   convertView.hidden = view !== "convert";
   historyView.hidden = view !== "history";
+  settingsView.hidden = view !== "settings";
+  convertNav.classList.toggle("active", view === "convert");
+  historyNav.classList.toggle("active", view === "history");
+  settingsNav.classList.toggle("active", view === "settings");
+  if (view === "history") await loadHistory();
+  if (view === "settings") renderSettings();
+}
 
-  if (view === "history") {
-    await loadHistory();
+async function startModelDownload() {
+  if (!settings || installedModels.has(selectedModel)) return;
+  try {
+    modelDownload = {
+      modelName: selectedModel,
+      phase: "starting",
+      progress: 0,
+      downloadedBytes: 0,
+      totalBytes: 0,
+      speedBps: 0,
+      error: null,
+    };
+    renderModelStatus();
+    await invoke("start_download_model_task", {
+      modelsDir: settings.modelsDir,
+      modelName: selectedModel,
+    });
+  } catch (error) {
+    modelDownload = {
+      modelName: selectedModel,
+      phase: "failed",
+      progress: 0,
+      downloadedBytes: 0,
+      totalBytes: 0,
+      speedBps: 0,
+      error: String(error),
+    };
+    renderModelStatus();
   }
 }
 
 async function initialize() {
-  settings =
-    await invoke<WhisperSettings>(
-      "load_settings",
-    );
+  const loadedSettings = await invoke<WhisperSettings>("load_settings");
+  settings = loadedSettings;
+  const savedModel = normalizeModelName(String(loadedSettings.modelPath ?? ""));
+  selectedModel = MODEL_CATALOG.some((model) => model.name === savedModel) ? savedModel : DEFAULT_MODEL;
 
-  // Prefer CUDA when available. Preserve an existing useful model choice;
-  // otherwise default to large-v3-turbo.
-  const savedModel = normalizeModelName(
-    String(settings.modelPath ?? ""),
-  );
+  // Keep the backend's V1 output policy automatic, but preserve genuine user
+  // choices (language, output folder, theme, backend and Speaker Detection).
+  loadedSettings.modelPath = modelFileName(selectedModel);
+  loadedSettings.speakerDetection = Boolean(loadedSettings.speakerDetection ?? false);
+  loadedSettings.speakerCount = 0;
+  loadedSettings.language = String(loadedSettings.language || "auto");
+  loadedSettings.outputDirMode = loadedSettings.outputDirMode === "custom" ? "custom" : "input_dir";
+  loadedSettings.outputDirPath = String(loadedSettings.outputDirPath ?? "");
+  loadedSettings.selectedBackend = loadedSettings.selectedBackend === "Standard" ? "Standard" : "CUDA";
+  loadedSettings.theme = ["carbon", "royal-blue", "emerald", "fire-orange"].includes(String(loadedSettings.theme))
+    ? loadedSettings.theme
+    : "carbon";
+  loadedSettings.ffmpegSource = "bundled";
 
-  selectedModel =
-    MODEL_CATALOG.some((model) => model.name === savedModel) &&
-    savedModel !== "tiny.en"
-      ? savedModel
-      : DEFAULT_MODEL;
-
-  settings.selectedBackend = "CUDA";
-  settings.modelPath = modelFileName(selectedModel);
-  settings.outputTxt = true;
-  settings.outputSrt = false;
-  settings.outputVtt = false;
-  settings.outputLrc = false;
-  settings.outputCsv = false;
-  settings.outputJson = false;
-  settings.outputJsonFull = false;
-  settings.vad = false;
-  settings.diarize = false;
-  settings.tinyDiarize = false;
-  settings.speakerDetection = Boolean(settings.speakerDetection ?? false);
-  // speakrs uses its VBx automatic speaker-count pipeline.
-  settings.speakerCount = 0;
-  settings.speakerClusterThreshold = Number.isFinite(
-    Number(settings.speakerClusterThreshold),
-  )
-    ? Math.max(0, Math.min(1, Number(settings.speakerClusterThreshold)))
-    : 0.5;
-  settings.ffmpegSource = "bundled";
-  settings.outputDirMode = "input_dir";
-  settings.outputDirPath = "";
-
-  await invoke(
-    "save_settings",
-    { settings },
-  );
-
-  renderModelOptions();
+  await persistSettings();
+  renderLanguageOptions();
+  applyTheme();
   await refreshInstalledModels();
   await refreshSpeakerDetectionStatus();
   await refreshQueue();
-  renderHistory();
+  renderSettings();
 }
 
-await listen<ModelDownloadProgress>(
-  "model-download-status",
-  async (event) => {
-    modelDownload = event.payload;
-
-    if (event.payload.phase === "completed") {
-      await refreshInstalledModels();
-      modelDownload = null;
-    }
-
-    renderModelStatus();
-  },
-);
-
-await listen<QueueSnapshot>(
-  "job-queue-updated",
-  async (event) => {
-    queue = event.payload;
-
-    const hasActive =
-      queue.jobs.some(isActive);
-
-    if (!hasActive) {
-      activeProgress = 0;
-      activeMessage = "";
-      activeMetrics = null;
-    }
-
-    renderQueue();
-
-    if (activeView === "history") {
-      await loadHistory();
-    }
-  },
-);
-
-await listen<TranscribeMetrics>(
-  "transcribe-metrics",
-  (event) => {
-    activeMetrics = event.payload;
-    activeProgress = event.payload.progress;
-    renderQueue();
-  },
-);
-
-await listen<TranscribeProgress>(
-  "transcribe-status",
-  (event) => {
-    activeProgress =
-      event.payload.progress ?? 0;
-    activeMessage =
-      event.payload.message ?? "";
-
-    // Live metrics are emitted by whisper.cpp only. Clear them while another
-    // stage is active so a previous file's Whisper RTF/ETA is never shown for
-    // conversion or Speaker Detection on the next queue item.
-    if (event.payload.stage !== "transcribing") {
-      activeMetrics = null;
-    }
-
-    renderQueue();
-  },
-);
-
-convertNav.addEventListener(
-  "click",
-  () => {
-    void showView("convert");
-  },
-);
-
-historyNav.addEventListener(
-  "click",
-  () => {
-    void showView("history");
-  },
-);
-
-modelSelect.addEventListener(
-  "change",
-  async () => {
-    selectedModel = modelSelect.value;
+await listen<ModelDownloadProgress>("model-download-status", async (event) => {
+  modelDownload = event.payload;
+  if (event.payload.phase === "completed") {
+    await refreshInstalledModels();
     modelDownload = null;
-    await applySelectedModel();
-  },
-);
+  }
+  renderModelStatus();
+});
 
-speakerDetectionCheckbox.addEventListener(
-  "change",
-  async () => {
-    if (!settings) return;
+await listen<QueueSnapshot>("job-queue-updated", async (event) => {
+  queue = event.payload;
+  if (!queue.jobs.some(isActive)) {
+    activeProgress = 0;
+    activeMessage = "";
+    activeMetrics = null;
+  }
+  renderQueue();
+  if (activeView === "history") await loadHistory();
+});
 
-    settings.speakerDetection = speakerDetectionCheckbox.checked;
-    await invoke("save_settings", { settings });
-    await refreshSpeakerDetectionStatus();
+await listen<TranscribeMetrics>("transcribe-metrics", (event) => {
+  activeMetrics = event.payload;
+  activeProgress = event.payload.progress;
+  renderQueue();
+});
+
+await listen<TranscribeProgress>("transcribe-status", (event) => {
+  activeProgress = event.payload.progress ?? 0;
+  activeMessage = event.payload.message ?? "";
+  if (event.payload.stage !== "transcribing") activeMetrics = null;
+  renderQueue();
+});
+
+convertNav.addEventListener("click", () => void showView("convert"));
+historyNav.addEventListener("click", () => void showView("history"));
+settingsNav.addEventListener("click", () => void showView("settings"));
+
+modelSelect.addEventListener("change", () => void applySelectedModel(modelSelect.value));
+settingsModelSelect.addEventListener("change", () => void applySelectedModel(settingsModelSelect.value));
+languageSelect.addEventListener("change", () => void applyLanguage(languageSelect.value));
+settingsLanguageSelect.addEventListener("change", () => void applyLanguage(settingsLanguageSelect.value));
+speakerDetectionCheckbox.addEventListener("change", () => void setSpeakerDetection(speakerDetectionCheckbox.checked));
+settingsSpeakerDetectionCheckbox.addEventListener("change", () => void setSpeakerDetection(settingsSpeakerDetectionCheckbox.checked));
+settingsDownloadModelButton.addEventListener("click", () => void startModelDownload());
+
+backendSelect.addEventListener("change", async () => {
+  if (!settings) return;
+  settings.selectedBackend = backendSelect.value;
+  await persistSettings();
+  await refreshInstalledModels();
+  await refreshSpeakerDetectionStatus();
+  renderQueue();
+  showToast(backendSelect.value === "CUDA" ? "CUDA backend selected." : "CPU backend selected.");
+});
+
+outputModeSelect.addEventListener("change", async () => {
+  if (!settings) return;
+  settings.outputDirMode = outputModeSelect.value;
+  await persistSettings();
+  renderSettings();
+});
+
+chooseOutputFolderButton.addEventListener("click", async () => {
+  if (!settings) return;
+  const path = await invoke<string | null>("select_directory");
+  if (!path) return;
+  try {
+    await invoke("verify_directory_writable", { dirPath: path });
+    settings.outputDirMode = "custom";
+    settings.outputDirPath = path;
+    await persistSettings();
+    renderSettings();
+    showToast("Output folder saved.");
+  } catch (error) {
+    showToast(`Cannot use that folder: ${String(error)}`);
+  }
+});
+
+themeSelect.addEventListener("change", async () => {
+  if (!settings) return;
+  settings.theme = themeSelect.value;
+  applyTheme();
+  await persistSettings();
+});
+
+async function browseFiles() {
+  const paths = await invoke<string[] | null>("select_files");
+  if (paths) await addPathsToQueue(paths);
+}
+
+addButton.addEventListener("click", () => void browseFiles());
+browseFilesButton.addEventListener("click", (event) => {
+  event.stopPropagation();
+  void browseFiles();
+});
+addFolderButton.addEventListener("click", async () => {
+  const path = await invoke<string | null>("select_directory");
+  if (path) await addPathsToQueue([path]);
+});
+dropZone.addEventListener("click", () => { if (!queue.running) void browseFiles(); });
+dropZone.addEventListener("keydown", (event) => {
+  if ((event.key === "Enter" || event.key === " ") && !queue.running) {
+    event.preventDefault();
+    void browseFiles();
+  }
+});
+
+await listen<boolean>("transcriber-native-drag-enter", (event) => {
+  dropZone.classList.toggle("drag-active", event.payload && !queue.running);
+});
+await listen<string[]>("transcriber-native-file-drop", async (event) => {
+  dropZone.classList.remove("drag-active");
+  if (!queue.running) await addPathsToQueue(event.payload);
+});
+
+startButton.addEventListener("click", async () => {
+  if (!settings) return;
+  try {
+    await invoke<QueueSnapshot>("start_job_queue", { settings });
+  } catch (error) {
+    showToast(`Queue failed: ${String(error)}`);
+    await refreshQueue();
+  }
+});
+
+clearQueueButton.addEventListener("click", async () => {
+  try {
+    queue = await invoke<QueueSnapshot>("clear_job_queue");
+    activeProgress = 0;
+    activeMessage = "";
+    activeMetrics = null;
     renderQueue();
-  },
-);
+  } catch (error) {
+    showToast(`Clear failed: ${String(error)}`);
+  }
+});
 
-speakerCountSelect.addEventListener(
-  "change",
-  async () => {
-    if (!settings) return;
-    settings.speakerCount = 0;
-    speakerCountSelect.value = "0";
-    await invoke("save_settings", { settings });
-    renderSpeakerDetectionStatus();
-  },
-);
-
-downloadModelButton.addEventListener(
-  "click",
-  async () => {
-    if (!settings || installedModels.has(selectedModel)) {
-      return;
+jobsContainer.addEventListener("click", async (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("button[data-action][data-job-id]");
+  if (!button) return;
+  const action = button.dataset.action;
+  const jobId = button.dataset.jobId;
+  if (!action || !jobId) return;
+  const index = queue.jobs.findIndex((job) => job.id === jobId);
+  if (index < 0) return;
+  button.disabled = true;
+  try {
+    if (action === "up" && index > 0) {
+      queue = await invoke<QueueSnapshot>("move_queue_job", { jobId, newIndex: index - 1 });
+    } else if (action === "down" && index < queue.jobs.length - 1) {
+      queue = await invoke<QueueSnapshot>("move_queue_job", { jobId, newIndex: index + 1 });
+    } else if (action === "cancel") {
+      queue = await invoke<QueueSnapshot>("cancel_queue_job", { jobId });
     }
+    renderQueue();
+  } catch (error) {
+    showToast(`${action} failed: ${String(error)}`);
+    await refreshQueue();
+  }
+});
 
-    try {
-      modelDownload = {
-        modelName: selectedModel,
-        phase: "starting",
-        progress: 0,
-        downloadedBytes: 0,
-        totalBytes: 0,
-        speedBps: 0,
-        error: null,
-      };
-
-      renderModelStatus();
-
-      await invoke(
-        "start_download_model_task",
-        {
-          modelsDir: settings.modelsDir,
-          modelName: selectedModel,
-        },
-      );
-    } catch (error) {
-      modelDownload = {
-        modelName: selectedModel,
-        phase: "failed",
-        progress: 0,
-        downloadedBytes: 0,
-        totalBytes: 0,
-        speedBps: 0,
-        error: String(error),
-      };
-
-      renderModelStatus();
-    }
-  },
-);
-
-addButton.addEventListener(
-  "click",
-  async () => {
-    const paths =
-      await invoke<string[] | null>(
-        "select_files",
-      );
-
-    if (paths) {
-      await addPathsToQueue(paths);
-    }
-  },
-);
-
-addFolderButton.addEventListener(
-  "click",
-  async () => {
-    const path =
-      await invoke<string | null>(
-        "select_directory",
-      );
-
-    if (path) {
-      await addPathsToQueue([path]);
-    }
-  },
-);
-
-dropZone.addEventListener(
-  "click",
-  () => {
-    if (!queue.running) {
-      addButton.click();
-    }
-  },
-);
-
-// Native file/folder dropping is bridged from Rust instead of relying on the
-// WebView2 JavaScript drag/drop helper. This avoids the Windows/Tauri path that
-// can show a forbidden cursor and fail to deliver the frontend callback.
-await listen<boolean>(
-  "transcriber-native-drag-enter",
-  (event) => {
-    const active = event.payload && !queue.running;
-
-    dropZone.style.borderColor =
-      active ? "#9a9a9a" : "#5b5b5b";
-    dropZone.style.background =
-      active ? "#272727" : "#202020";
-  },
-);
-
-await listen<string[]>(
-  "transcriber-native-file-drop",
-  async (event) => {
-    dropZone.style.borderColor = "#5b5b5b";
-    dropZone.style.background = "#202020";
-
-    if (!queue.running) {
-      await addPathsToQueue(event.payload);
-    }
-  },
-);
-
-startButton.addEventListener(
-  "click",
-  async () => {
-    if (!settings) {
-      return;
-    }
-
-    try {
-      await invoke<QueueSnapshot>(
-        "start_job_queue",
-        { settings },
-      );
-    } catch (error) {
-      queueSummary.textContent =
-        `Queue failed: ${String(error)}`;
-
-      await refreshQueue();
-    }
-  },
-);
-
-clearQueueButton.addEventListener(
-  "click",
-  async () => {
-    try {
-      queue =
-        await invoke<QueueSnapshot>(
-          "clear_job_queue",
-        );
-
-      activeProgress = 0;
-      activeMessage = "";
-      activeMetrics = null;
-
-      renderQueue();
-    } catch (error) {
-      queueSummary.textContent =
-        `Clear failed: ${String(error)}`;
-    }
-  },
-);
-
-jobsContainer.addEventListener(
-  "click",
-  async (event) => {
-    const target =
-      event.target as HTMLElement;
-
-    const button =
-      target.closest<HTMLButtonElement>(
-        "button[data-action][data-job-id]",
-      );
-
-    if (!button) {
-      return;
-    }
-
-    const action =
-      button.dataset.action;
-    const jobId =
-      button.dataset.jobId;
-
-    if (!action || !jobId) {
-      return;
-    }
-
-    const index =
-      queue.jobs.findIndex(
-        (job) => job.id === jobId,
-      );
-
-    if (index < 0) {
-      return;
-    }
-
-    button.disabled = true;
-
-    try {
-      if (action === "up" && index > 0) {
-        queue =
-          await invoke<QueueSnapshot>(
-            "move_queue_job",
-            {
-              jobId,
-              newIndex: index - 1,
-            },
-          );
-      }
-
-      if (
-        action === "down" &&
-        index < queue.jobs.length - 1
-      ) {
-        queue =
-          await invoke<QueueSnapshot>(
-            "move_queue_job",
-            {
-              jobId,
-              newIndex: index + 1,
-            },
-          );
-      }
-
-      if (action === "cancel") {
-        queue =
-          await invoke<QueueSnapshot>(
-            "cancel_queue_job",
-            { jobId },
-          );
-      }
-
-      renderQueue();
-    } catch (error) {
-      queueSummary.textContent =
-        `${action} failed: ${String(
-          error,
-        )}`;
-
-      await refreshQueue();
-    }
-  },
-);
-
-refreshHistoryButton.addEventListener(
-  "click",
-  loadHistory,
-);
-
-clearHistoryButton.addEventListener(
-  "click",
-  async () => {
-    try {
-      await invoke("clear_history");
-      await loadHistory();
-    } catch (error) {
-      historySummary.textContent =
-        `Clear history failed: ${String(
-          error,
-        )}`;
-    }
-  },
-);
-
-historyContainer.addEventListener(
-  "click",
-  async (event) => {
-    const target =
-      event.target as HTMLElement;
-
-    const button =
-      target.closest<HTMLButtonElement>(
-        "button[data-delete-history-id]",
-      );
-
-    if (!button) {
-      return;
-    }
-
-    const id =
-      button.dataset.deleteHistoryId;
-
-    if (!id) {
-      return;
-    }
-
-    button.disabled = true;
-
-    try {
-      await invoke<boolean>(
-        "delete_history_entry",
-        { id },
-      );
-
-      await loadHistory();
-    } catch (error) {
-      historySummary.textContent =
-        `Delete failed: ${String(error)}`;
-    }
-  },
-);
+refreshHistoryButton.addEventListener("click", () => void loadHistory());
+clearHistoryButton.addEventListener("click", async () => {
+  if (historyEntries.length && !window.confirm("Clear all Transcriber history records? Output files will not be deleted.")) return;
+  try {
+    await invoke("clear_history");
+    await loadHistory();
+  } catch (error) {
+    showToast(`Clear history failed: ${String(error)}`);
+  }
+});
+historySearch.addEventListener("input", () => {
+  historyQuery = historySearch.value;
+  renderHistory();
+});
+historyContainer.addEventListener("click", async (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("button[data-delete-history-id]");
+  if (!button) return;
+  const id = button.dataset.deleteHistoryId;
+  if (!id) return;
+  button.disabled = true;
+  try {
+    await invoke<boolean>("delete_history_entry", { id });
+    await loadHistory();
+  } catch (error) {
+    showToast(`Delete failed: ${String(error)}`);
+  }
+});
 
 initialize().catch((error) => {
-  queueSummary.textContent =
-    `Initialization failed: ${String(
-      error,
-    )}`;
+  queueSummary.innerHTML = `<div class="error-box">Initialization failed: ${escapeHtml(String(error))}</div>`;
 });

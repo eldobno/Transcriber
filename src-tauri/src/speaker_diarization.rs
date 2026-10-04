@@ -825,7 +825,24 @@ pub fn build_speaker_transcript_from_whisper_json(
         turns.push((speaker, word.text));
     }
 
+    // When diarization found only one speaker, Speaker 1 labels add noise and
+    // make an ordinary monologue harder to read. Keep Speaker N prefixes only
+    // when the diarization result actually contains multiple speaker IDs.
+    let speaker_count = segments
+        .iter()
+        .map(|segment| segment.speaker)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+
     let mut output = String::new();
+
+    if speaker_count <= 1 {
+        for (_, text) in &turns {
+            append_word(&mut output, text.trim());
+        }
+        output.push('\n');
+        return Ok(output);
+    }
 
     for (index, (speaker, text)) in turns.iter().enumerate() {
         if index > 0 {
@@ -901,5 +918,75 @@ mod tests {
         assert!(is_special_token("[_SOT_]"));
         assert!(is_special_token("<|endoftext|>"));
         assert!(!is_special_token("hello"));
+    }
+
+    #[test]
+    fn single_speaker_transcript_omits_speaker_label() {
+        let path = std::env::temp_dir().join(format!(
+            "transcriber_single_speaker_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        std::fs::write(
+            &path,
+            r#"{"transcription":[{"tokens":[{"text":"Hello","offsets":{"from":0,"to":500}},{"text":" world","offsets":{"from":500,"to":1000}}]}]}"#,
+        )
+        .unwrap();
+
+        let segments = vec![SpeakerSegment {
+            start_sec: 0.0,
+            end_sec: 1.0,
+            speaker: 0,
+            confidence: None,
+        }];
+
+        let transcript = build_speaker_transcript_from_whisper_json(&path, &segments).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert!(!transcript.contains("Speaker 1:"));
+        assert_eq!(transcript.trim(), "Hello world");
+    }
+
+    #[test]
+    fn multi_speaker_transcript_keeps_speaker_labels() {
+        let path = std::env::temp_dir().join(format!(
+            "transcriber_multi_speaker_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        std::fs::write(
+            &path,
+            r#"{"transcription":[{"tokens":[{"text":"Hello","offsets":{"from":0,"to":500}},{"text":" there","offsets":{"from":500,"to":1000}}]}]}"#,
+        )
+        .unwrap();
+
+        let segments = vec![
+            SpeakerSegment {
+                start_sec: 0.0,
+                end_sec: 0.5,
+                speaker: 0,
+                confidence: None,
+            },
+            SpeakerSegment {
+                start_sec: 0.5,
+                end_sec: 1.0,
+                speaker: 1,
+                confidence: None,
+            },
+        ];
+
+        let transcript = build_speaker_transcript_from_whisper_json(&path, &segments).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert!(transcript.contains("Speaker 1:"));
+        assert!(transcript.contains("Speaker 2:"));
     }
 }
