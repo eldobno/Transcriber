@@ -12,6 +12,7 @@ mod job_queue;
 mod media_preview;
 mod output;
 mod settings;
+mod speaker_diarization;
 mod subtitle;
 mod transcribe;
 mod translation;
@@ -19,7 +20,7 @@ mod video_server;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use builder::check_build_exists;
 use downloader::{
@@ -49,6 +50,7 @@ struct LogState(Arc<AppLogs>);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionPhase {
     Idle,
+    Diarizing,
     Transcribing,
     Translating,
     Finalizing,
@@ -1190,6 +1192,54 @@ fn main() {
                     .build(_app)?;
             }
 
+            // Windows/WebView2 can be unreliable when forwarding native file
+            // drag/drop through the JavaScript Webview helper. Listen at the
+            // Rust webview layer and bridge only the small events our frontend
+            // needs. This still uses Tauri's native drag/drop handler, so we
+            // receive real filesystem paths for both files and directories.
+            if let Some(window) = _app.get_webview_window("main") {
+                let event_window = window.clone();
+
+                window.as_ref().on_webview_event(move |event| {
+                    let tauri::WebviewEvent::DragDrop(event) = event else {
+                        return;
+                    };
+
+                    match event {
+                        tauri::DragDropEvent::Enter { .. } => {
+                            let _ = event_window.emit(
+                                "transcriber-native-drag-enter",
+                                true,
+                            );
+                        }
+                        tauri::DragDropEvent::Over { .. } => {}
+                        tauri::DragDropEvent::Drop { paths, .. } => {
+                            let paths = paths
+                                .iter()
+                                .map(|path| path.to_string_lossy().to_string())
+                                .collect::<Vec<_>>();
+
+                            let _ = event_window.emit(
+                                "transcriber-native-file-drop",
+                                paths,
+                            );
+
+                            let _ = event_window.emit(
+                                "transcriber-native-drag-enter",
+                                false,
+                            );
+                        }
+                        tauri::DragDropEvent::Leave => {
+                            let _ = event_window.emit(
+                                "transcriber-native-drag-enter",
+                                false,
+                            );
+                        }
+                        _ => {}
+                    }
+                });
+            }
+
             let initial_settings = load_settings_file();
             let initial_scale = initial_settings.ui_scale;
             if let Some(window) = _app.get_webview_window("main") {
@@ -1243,6 +1293,8 @@ fn main() {
             history::get_history_entry,
             history::delete_history_entry,
             history::clear_history,
+
+            speaker_diarization::get_speaker_detection_status,
 
             check_build,
             probe_media_file,

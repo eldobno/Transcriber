@@ -164,6 +164,17 @@ let selectedModel = DEFAULT_MODEL;
 let installedModels = new Set<string>();
 let modelDownload: ModelDownloadProgress | null = null;
 
+type SpeakerDetectionStatus = {
+  available: boolean;
+  runtimeFound: boolean;
+  segmentationModelFound: boolean;
+  embeddingModelFound: boolean;
+  missing: string[];
+};
+
+let speakerDetectionStatus: SpeakerDetectionStatus | null = null;
+let speakerDetectionStatusError: string | null = null;
+
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   <main>
     <div style="
@@ -221,13 +232,75 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         "></div>
       </div>
 
+      <div id="speaker-panel" style="
+        padding:16px;
+        border:1px solid #444;
+        border-radius:8px;
+        background:#242424;
+        margin-bottom:18px;
+      ">
+        <div style="display:flex; align-items:center; gap:14px; flex-wrap:wrap;">
+          <label style="display:flex; align-items:center; gap:9px; cursor:pointer;">
+            <input id="speaker-detection" type="checkbox">
+            <strong>Speaker Detection</strong>
+            <span style="font-size:0.78rem; color:#aaa;">Beta</span>
+          </label>
+
+          <label style="display:flex; align-items:center; gap:8px;">
+            <span style="font-size:0.9rem; color:#b8b8b8;">Speakers</span>
+            <select id="speaker-count" style="
+              font:inherit;
+              padding:7px 10px;
+              border-radius:7px;
+              border:1px solid #454545;
+              background:#171717;
+              color:inherit;
+            ">
+              <option value="0">Auto (VBx)</option>
+            </select>
+          </label>
+        </div>
+
+        <div id="speaker-status" style="
+          margin-top:10px;
+          color:#b8b8b8;
+          font-size:0.9rem;
+          line-height:1.5;
+        "></div>
+      </div>
+
+      <div id="drop-zone" style="
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:18px;
+        padding:20px;
+        margin-bottom:14px;
+        border:1px dashed #5b5b5b;
+        border-radius:10px;
+        background:#202020;
+        cursor:pointer;
+        transition:border-color 120ms ease, background 120ms ease;
+      ">
+        <div>
+          <div style="font-weight:600;">Drop files or folders here</div>
+          <div style="margin-top:4px; color:#999; font-size:0.9rem;">
+            Audio and video files are added automatically. Folders are scanned recursively.
+          </div>
+        </div>
+        <div style="color:#888; font-size:0.85rem; white-space:nowrap;">
+          Click to browse
+        </div>
+      </div>
+
       <div style="
         display:flex;
-        gap:12px;
+        gap:10px;
         flex-wrap:wrap;
         margin-bottom:24px;
       ">
         <button id="add-files">Add Files</button>
+        <button id="add-folder">Add Folder</button>
         <button id="start-queue" disabled>Start Queue</button>
         <button id="clear-queue">Clear</button>
       </div>
@@ -250,6 +323,20 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       <div id="history-summary"></div>
       <div id="history-list"></div>
     </section>
+
+    <div id="toast" hidden style="
+      position:fixed;
+      right:24px;
+      bottom:24px;
+      max-width:360px;
+      padding:11px 14px;
+      border:1px solid #4b4b4b;
+      border-radius:9px;
+      background:#292929;
+      box-shadow:0 12px 32px rgba(0,0,0,.28);
+      font-size:0.9rem;
+      z-index:1000;
+    "></div>
   </main>
 `;
 
@@ -275,6 +362,12 @@ const historyContainer =
 
 const addButton =
   document.querySelector<HTMLButtonElement>("#add-files")!;
+const addFolderButton =
+  document.querySelector<HTMLButtonElement>("#add-folder")!;
+const dropZone =
+  document.querySelector<HTMLDivElement>("#drop-zone")!;
+const toast =
+  document.querySelector<HTMLDivElement>("#toast")!;
 const startButton =
   document.querySelector<HTMLButtonElement>("#start-queue")!;
 const clearQueueButton =
@@ -286,6 +379,13 @@ const downloadModelButton =
   document.querySelector<HTMLButtonElement>("#download-model")!;
 const modelStatus =
   document.querySelector<HTMLDivElement>("#model-status")!;
+
+const speakerDetectionCheckbox =
+  document.querySelector<HTMLInputElement>("#speaker-detection")!;
+const speakerCountSelect =
+  document.querySelector<HTMLSelectElement>("#speaker-count")!;
+const speakerStatus =
+  document.querySelector<HTMLDivElement>("#speaker-status")!;
 
 const refreshHistoryButton =
   document.querySelector<HTMLButtonElement>("#refresh-history")!;
@@ -455,6 +555,63 @@ function renderModelStatus() {
     downloadModelButton.textContent = "Download Model";
     downloadModelButton.disabled = queue.running;
   }
+}
+
+function renderSpeakerDetectionStatus() {
+  if (!settings) return;
+
+  const enabled = Boolean(settings.speakerDetection);
+  speakerDetectionCheckbox.checked = enabled;
+  speakerCountSelect.value = "0";
+  speakerCountSelect.disabled = true;
+  speakerDetectionCheckbox.disabled = queue.running;
+
+  if (!enabled) {
+    speakerStatus.textContent =
+      "Off. Enable for Speaker 1 / Speaker 2 clustering in the transcript.";
+    return;
+  }
+
+  if (speakerDetectionStatusError) {
+    speakerStatus.textContent =
+      `Status check unavailable • ${speakerDetectionStatusError}`;
+    return;
+  }
+
+  if (!speakerDetectionStatus) {
+    speakerStatus.textContent = "Checking local speaker-detection runtime…";
+    return;
+  }
+
+  if (speakerDetectionStatus.available) {
+    speakerStatus.textContent =
+      "Ready • speakrs PLDA + VBx • speaker count: Auto";
+    return;
+  }
+
+  speakerStatus.textContent =
+    `Not installed • missing: ${speakerDetectionStatus.missing.join(", ")}`;
+}
+
+async function refreshSpeakerDetectionStatus() {
+  if (!settings) return;
+
+  try {
+    speakerDetectionStatus =
+      await invoke<SpeakerDetectionStatus>(
+        "get_speaker_detection_status",
+        { modelsDir: settings.modelsDir },
+      );
+    speakerDetectionStatusError = null;
+  } catch (error) {
+    speakerDetectionStatus = null;
+    speakerDetectionStatusError = String(error);
+    renderSpeakerDetectionStatus();
+    return;
+  }
+
+  renderSpeakerDetectionStatus();
+  renderQueue();
 }
 
 async function refreshInstalledModels() {
@@ -891,13 +1048,23 @@ function renderQueue() {
   const selectedInstalled =
     installedModels.has(selectedModel);
 
+  // Do not make the entire queue button dead just because the optional
+  // frontend status probe is unavailable. The backend validates the actual
+  // diarization runtime/models when the job starts and returns a concrete
+  // per-job error if something is missing.
   startButton.disabled =
-    queue.running || !hasRunnableJobs || !selectedInstalled;
+    queue.running ||
+    !hasRunnableJobs ||
+    !selectedInstalled;
 
   addButton.disabled = queue.running;
+  addFolderButton.disabled = queue.running;
+  dropZone.style.pointerEvents = queue.running ? "none" : "auto";
+  dropZone.style.opacity = queue.running ? "0.55" : "1";
   clearQueueButton.disabled = queue.running;
 
   renderModelStatus();
+  renderSpeakerDetectionStatus();
 }
 
 function renderHistory() {
@@ -1084,6 +1251,49 @@ function renderHistory() {
     .join("");
 }
 
+let toastTimer: number | null = null;
+
+function showToast(message: string) {
+  toast.textContent = message;
+  toast.hidden = false;
+
+  if (toastTimer !== null) {
+    window.clearTimeout(toastTimer);
+  }
+
+  toastTimer = window.setTimeout(() => {
+    toast.hidden = true;
+    toastTimer = null;
+  }, 3200);
+}
+
+async function addPathsToQueue(paths: string[]) {
+  if (paths.length === 0) {
+    return;
+  }
+
+  try {
+    const result =
+      await invoke<AddJobsResult>(
+        "add_job_queue_files",
+        { paths },
+      );
+
+    queue = result.queue;
+    renderQueue();
+
+    if (result.ignoredPaths.length > 0) {
+      const count = result.ignoredPaths.length;
+      showToast(
+        `${count} unsupported ${count === 1 ? "item was" : "items were"} skipped.`,
+      );
+    }
+  } catch (error) {
+    queueSummary.textContent =
+      `Adding files failed: ${String(error)}`;
+  }
+}
+
 async function refreshQueue() {
   queue =
     await invoke<QueueSnapshot>("get_job_queue");
@@ -1152,6 +1362,14 @@ async function initialize() {
   settings.vad = false;
   settings.diarize = false;
   settings.tinyDiarize = false;
+  settings.speakerDetection = Boolean(settings.speakerDetection ?? false);
+  // speakrs 0.5 uses its VBx automatic speaker-count pipeline.
+  settings.speakerCount = 0;
+  settings.speakerClusterThreshold = Number.isFinite(
+    Number(settings.speakerClusterThreshold),
+  )
+    ? Math.max(0, Math.min(1, Number(settings.speakerClusterThreshold)))
+    : 0.5;
   settings.ffmpegSource = "bundled";
   settings.outputDirMode = "input_dir";
   settings.outputDirPath = "";
@@ -1163,6 +1381,7 @@ async function initialize() {
 
   renderModelOptions();
   await refreshInstalledModels();
+  await refreshSpeakerDetectionStatus();
   await refreshQueue();
   renderHistory();
 }
@@ -1247,6 +1466,29 @@ modelSelect.addEventListener(
   },
 );
 
+speakerDetectionCheckbox.addEventListener(
+  "change",
+  async () => {
+    if (!settings) return;
+
+    settings.speakerDetection = speakerDetectionCheckbox.checked;
+    await invoke("save_settings", { settings });
+    await refreshSpeakerDetectionStatus();
+    renderQueue();
+  },
+);
+
+speakerCountSelect.addEventListener(
+  "change",
+  async () => {
+    if (!settings) return;
+    settings.speakerCount = 0;
+    speakerCountSelect.value = "0";
+    await invoke("save_settings", { settings });
+    renderSpeakerDetectionStatus();
+  },
+);
+
 downloadModelButton.addEventListener(
   "click",
   async () => {
@@ -1293,38 +1535,63 @@ downloadModelButton.addEventListener(
 addButton.addEventListener(
   "click",
   async () => {
-    try {
-      const paths =
-        await invoke<string[] | null>(
-          "select_files",
-        );
+    const paths =
+      await invoke<string[] | null>(
+        "select_files",
+      );
 
-      if (!paths || paths.length === 0) {
-        return;
-      }
+    if (paths) {
+      await addPathsToQueue(paths);
+    }
+  },
+);
 
-      const result =
-        await invoke<AddJobsResult>(
-          "add_job_queue_files",
-          { paths },
-        );
+addFolderButton.addEventListener(
+  "click",
+  async () => {
+    const path =
+      await invoke<string | null>(
+        "select_directory",
+      );
 
-      queue = result.queue;
-      renderQueue();
+    if (path) {
+      await addPathsToQueue([path]);
+    }
+  },
+);
 
-      if (
-        result.ignoredPaths.length > 0
-      ) {
-        console.log(
-          "Unsupported files ignored:",
-          result.ignoredPaths,
-        );
-      }
-    } catch (error) {
-      queueSummary.textContent =
-        `Adding files failed: ${String(
-          error,
-        )}`;
+dropZone.addEventListener(
+  "click",
+  () => {
+    if (!queue.running) {
+      addButton.click();
+    }
+  },
+);
+
+// Native file/folder dropping is bridged from Rust instead of relying on the
+// WebView2 JavaScript drag/drop helper. This avoids the Windows/Tauri path that
+// can show a forbidden cursor and fail to deliver the frontend callback.
+await listen<boolean>(
+  "transcriber-native-drag-enter",
+  (event) => {
+    const active = event.payload && !queue.running;
+
+    dropZone.style.borderColor =
+      active ? "#9a9a9a" : "#5b5b5b";
+    dropZone.style.background =
+      active ? "#272727" : "#202020";
+  },
+);
+
+await listen<string[]>(
+  "transcriber-native-file-drop",
+  async (event) => {
+    dropZone.style.borderColor = "#5b5b5b";
+    dropZone.style.background = "#202020";
+
+    if (!queue.running) {
+      await addPathsToQueue(event.payload);
     }
   },
 );

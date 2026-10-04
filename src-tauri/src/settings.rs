@@ -60,6 +60,16 @@ pub struct WhisperSettings {
     pub translate: bool,
     pub diarize: bool,
     pub tiny_diarize: bool,
+    /// Transcriber speaker clustering (sherpa-onnx). Separate from whisper.cpp's
+    /// legacy stereo diarization and TinyDiarize speaker-turn tokens.
+    #[serde(default)]
+    pub speaker_detection: bool,
+    /// 0 = automatic speaker count; positive values lock clustering to that count.
+    #[serde(default)]
+    pub speaker_count: i32,
+    /// Used only when speaker_count == 0. sherpa-onnx reference default is 0.5.
+    #[serde(default = "default_speaker_cluster_threshold", deserialize_with = "deserialize_f64_lenient")]
+    pub speaker_cluster_threshold: f64,
     pub no_fallback: bool,
     pub flash_attn: bool,
     pub output_txt: bool,
@@ -193,6 +203,10 @@ fn default_ui_language() -> String {
     "en".to_string()
 }
 
+fn default_speaker_cluster_threshold() -> f64 {
+    0.5
+}
+
 impl Default for WhisperSettings {
     fn default() -> Self {
         Self::default_settings()
@@ -226,6 +240,9 @@ impl WhisperSettings {
             translate: false,
             diarize: false,
             tiny_diarize: false,
+            speaker_detection: false,
+            speaker_count: 0,
+            speaker_cluster_threshold: 0.5,
             no_fallback: false,
             flash_attn: true,
             output_txt: false,
@@ -324,6 +341,12 @@ impl WhisperSettings {
             self.vad_speech_pad = 30;
         }
         self.vad_overlap = self.vad_overlap.clamp(0.0, 1.0);
+
+        self.speaker_count = self.speaker_count.clamp(0, 16);
+        if !self.speaker_cluster_threshold.is_finite() {
+            self.speaker_cluster_threshold = 0.5;
+        }
+        self.speaker_cluster_threshold = self.speaker_cluster_threshold.clamp(0.0, 1.0);
 
         self.temperature = self.temperature.clamp(0.0, 2.0);
         self.temperature_inc = self.temperature_inc.clamp(0.0, 2.0);

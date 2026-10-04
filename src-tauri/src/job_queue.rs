@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -138,6 +139,82 @@ fn is_supported_media(path: &str) -> bool {
         || crate::VIDEO_EXTENSIONS.contains(&extension.as_str())
 }
 
+fn collect_input_path(
+    path: &Path,
+    media_paths: &mut Vec<String>,
+    ignored_paths: &mut Vec<String>,
+    visited_directories: &mut HashSet<String>,
+) {
+    if path.is_dir() {
+        let directory_key = std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .to_string();
+
+        #[cfg(target_os = "windows")]
+        let directory_key = directory_key.to_lowercase();
+
+        if !visited_directories.insert(directory_key) {
+            return;
+        }
+
+        let mut entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>(),
+            Err(_) => {
+                ignored_paths.push(path.to_string_lossy().to_string());
+                return;
+            }
+        };
+
+        // Stable, human-friendly ordering for recursively-added folders.
+        entries.sort_by(|left, right| {
+            left.to_string_lossy()
+                .to_lowercase()
+                .cmp(&right.to_string_lossy().to_lowercase())
+        });
+
+        for entry in entries {
+            collect_input_path(&entry, media_paths, ignored_paths, visited_directories);
+        }
+
+        return;
+    }
+
+    if path.is_file() {
+        let value = path.to_string_lossy().to_string();
+
+        if is_supported_media(&value) {
+            media_paths.push(value);
+        } else {
+            ignored_paths.push(value);
+        }
+
+        return;
+    }
+
+    ignored_paths.push(path.to_string_lossy().to_string());
+}
+
+fn expand_input_paths(paths: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut media_paths = Vec::new();
+    let mut ignored_paths = Vec::new();
+    let mut visited_directories = HashSet::new();
+
+    for raw_path in paths {
+        collect_input_path(
+            Path::new(&raw_path),
+            &mut media_paths,
+            &mut ignored_paths,
+            &mut visited_directories,
+        );
+    }
+
+    (media_paths, ignored_paths)
+}
+
 fn history_context(
     job: &QueueJob,
     settings: &crate::settings::WhisperSettings,
@@ -204,14 +281,9 @@ pub async fn add_job_queue_files(
     state: State<'_, JobQueueState>,
     paths: Vec<String>,
 ) -> Result<AddJobsResult, String> {
-    let mut ignored_paths = Vec::new();
+    let (paths, ignored_paths) = expand_input_paths(paths);
 
     for path in paths {
-        if !is_supported_media(&path) {
-            ignored_paths.push(path);
-            continue;
-        }
-
         let key = path_key(&path);
 
         let job_id = {
@@ -645,7 +717,11 @@ pub async fn start_job_queue(
                 } else {
                     job.status = JobStatus::Transcribing;
                     job.progress = 0.0;
-                    job.message = Some("Transcribing".to_string());
+                    job.message = Some(if job_settings.speaker_detection {
+                        "Detecting speakers".to_string()
+                    } else {
+                        "Transcribing".to_string()
+                    });
                     false
                 }
             } else {
@@ -672,6 +748,104 @@ pub async fn start_job_queue(
 
         // Every queued file uses Transcriber's output policy while
         // preserving the selected model/backend and transcription options.
+
+        // ----------------------------------------------------
+        // Optional Speaker Detection (Beta)
+        // ----------------------------------------------------
+        // Reuse the exact 16 kHz mono WAV that Whisper is about to consume.
+        // This keeps diarization and Whisper word timestamps on the same audio
+        // timeline and avoids a second decode/resample pass.
+        let speaker_segments = if job_settings.speaker_detection {
+            match crate::speaker_diarization::run_speaker_diarization(
+                app.clone(),
+                logs.clone(),
+                session.clone(),
+                &wav_path,
+                &job_settings,
+            )
+            .await
+            {
+                Ok(segments) => Some(segments),
+                Err(error) => {
+                    // Whisper normally owns temporary WAV cleanup. If speaker
+                    // detection fails before Whisper starts, clean it here.
+                    let _ = std::fs::remove_file(&wav_path);
+
+                    let mut queue = queue_state
+                        .lock()
+                        .map_err(|lock_error| format!("Queue lock error: {lock_error}"))?;
+
+                    let mut terminal_job = None;
+                    if let Some(job) = queue.jobs.iter_mut().find(|job| job.id == job_id) {
+                        if job.cancel_requested || looks_cancelled(&error) {
+                            job.status = JobStatus::Cancelled;
+                            job.progress = 0.0;
+                            job.message = Some("Cancelled".to_string());
+                            job.error = None;
+                        } else {
+                            job.status = JobStatus::Failed;
+                            job.progress = 0.0;
+                            job.message = Some("Speaker Detection failed".to_string());
+                            job.error = Some(error);
+                        }
+                        job.completed_at_ms = Some(now_ms());
+                        terminal_job = Some(job.clone());
+                    }
+
+                    emit_queue(&app, &queue);
+                    if let Some(job) = terminal_job {
+                        record_history_finished(&app, &logs, &history_state, &job, &job_settings);
+                    }
+
+                    // A diarization failure affects only this file, never the
+                    // rest of the sequential queue.
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        // Cancellation can also land between the diarization child exiting and
+        // Whisper starting. Honour it before launching the expensive model.
+        let cancelled_before_whisper = {
+            let mut queue = queue_state
+                .lock()
+                .map_err(|error| format!("Queue lock error: {error}"))?;
+
+            let cancelled = if let Some(job) = queue.jobs.iter_mut().find(|job| job.id == job_id) {
+                if job.cancel_requested {
+                    job.status = JobStatus::Cancelled;
+                    job.progress = 0.0;
+                    job.message = Some("Cancelled".to_string());
+                    job.error = None;
+                    job.completed_at_ms = Some(now_ms());
+                    true
+                } else {
+                    job.status = JobStatus::Transcribing;
+                    job.progress = 0.0;
+                    job.message = Some("Transcribing".to_string());
+                    false
+                }
+            } else {
+                true
+            };
+
+            emit_queue(&app, &queue);
+            cancelled
+        };
+
+        if cancelled_before_whisper {
+            let _ = std::fs::remove_file(&wav_path);
+
+            let queue = queue_state
+                .lock()
+                .map_err(|error| format!("Queue lock error: {error}"))?;
+            if let Some(job) = queue.jobs.iter().find(|job| job.id == job_id) {
+                record_history_finished(&app, &logs, &history_state, job, &job_settings);
+            }
+            continue;
+        }
 
         // ----------------------------------------------------
         // Existing Whisper Desktop whisper.cpp pipeline
@@ -711,6 +885,7 @@ pub async fn start_job_queue(
                     &source_path,
                     &result.output_dir,
                     &result.generated_files,
+                    speaker_segments.as_deref(),
                 )
                 .await;
 

@@ -23,26 +23,23 @@ pub fn prepare_job_settings(base: &WhisperSettings, source_path: &str) -> Whispe
     settings.input_file = source_path.to_string();
 
     // Transcriber's V1 output policy:
-    // - audio -> TXT
-    // - video -> whisper.cpp full JSON with token timestamps, then Transcriber
-    //   constructs movie-style cues and embeds them in a new MKV.
-    if is_video_file(source_path) {
+    // - normal audio -> TXT
+    // - normal video -> full Whisper JSON -> custom movie subtitles -> soft-sub MKV
+    // - Speaker Detection -> full Whisper JSON for word-level speaker assignment.
+    if is_video_file(source_path) || settings.speaker_detection {
         settings.output_txt = false;
         settings.output_srt = false;
         settings.output_json = false;
         settings.output_json_full = true;
 
-        // We need token-level timestamps for our subtitle engine.
+        // Word timestamps are required by both the movie subtitle engine and
+        // WhisperX-style word-to-speaker assignment.
         settings.dtw_enabled = true;
 
-        // IMPORTANT: whisper.cpp's current CLI JSON writer still exposes
-        // VAD-compressed token times when --vad and -ojf are combined. Segment
-        // times are mapped back but token times are not, causing growing drift.
-        // Keep VAD off specifically for the word-timestamp subtitle pass until
-        // upstream's CLI JSON path uses the VAD-aware token timestamp accessors.
+        // whisper.cpp's current full-JSON + VAD path can expose compressed token
+        // timestamps. Keep VAD disabled whenever we consume token timestamps.
         settings.vad = false;
 
-        // Cue segmentation is ours now, not whisper.cpp's.
         settings.max_len = 0;
         settings.split_word = false;
     } else {
@@ -74,11 +71,26 @@ pub async fn finalize_transcription_outputs(
     source_path: &str,
     output_dir: &str,
     generated_files: &[String],
+    speaker_segments: Option<&[crate::speaker_diarization::SpeakerSegment]>,
 ) -> Result<Vec<String>, String> {
     if is_video_file(source_path) {
-        finalize_video(app, logs, session, source_path, output_dir, generated_files).await
+        finalize_video(
+            app,
+            logs,
+            session,
+            source_path,
+            output_dir,
+            generated_files,
+            speaker_segments,
+        )
+        .await
     } else {
-        finalize_audio(source_path, output_dir, generated_files)
+        finalize_audio(
+            source_path,
+            output_dir,
+            generated_files,
+            speaker_segments,
+        )
     }
 }
 
@@ -86,8 +98,44 @@ fn finalize_audio(
     source_path: &str,
     output_dir: &str,
     generated_files: &[String],
+    speaker_segments: Option<&[crate::speaker_diarization::SpeakerSegment]>,
 ) -> Result<Vec<String>, String> {
     let output_dir = PathBuf::from(output_dir);
+    let source_stem = Path::new(source_path)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let desired = unique_path(&output_dir, &format!("{}_transcribed", source_stem), "txt");
+
+    if let Some(segments) = speaker_segments {
+        let Some(json_name) = generated_files
+            .iter()
+            .find(|file| file.to_ascii_lowercase().ends_with(".json"))
+        else {
+            return Err(
+                "Speaker Detection needs Whisper full JSON, but no timing JSON was generated."
+                    .to_string(),
+            );
+        };
+
+        let json_path = output_dir.join(json_name);
+        let transcript = crate::speaker_diarization::build_speaker_transcript_from_whisper_json(
+            &json_path,
+            segments,
+        )?;
+
+        std::fs::write(&desired, transcript).map_err(|error| {
+            format!(
+                "Failed to write speaker-labelled transcript '{}': {error}",
+                desired.display()
+            )
+        })?;
+
+        // Full JSON is an implementation detail unless the user explicitly asks
+        // for it in a future advanced output setting.
+        let _ = std::fs::remove_file(json_path);
+        return Ok(vec![file_name_string(&desired)?]);
+    }
 
     let Some(txt_name) = generated_files
         .iter()
@@ -104,13 +152,6 @@ fn finalize_audio(
             source_txt.display()
         ));
     }
-
-    let source_stem = Path::new(source_path)
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
-
-    let desired = unique_path(&output_dir, &format!("{}_transcribed", source_stem), "txt");
 
     if source_txt != desired {
         std::fs::rename(&source_txt, &desired).map_err(|error| {
@@ -132,6 +173,7 @@ async fn finalize_video(
     source_path: &str,
     output_dir: &str,
     generated_files: &[String],
+    speaker_segments: Option<&[crate::speaker_diarization::SpeakerSegment]>,
 ) -> Result<Vec<String>, String> {
     let output_dir = PathBuf::from(output_dir);
 
@@ -296,6 +338,38 @@ async fn finalize_video(
         });
     }
 
+    // Speaker Detection does not alter the movie subtitle track. For video we
+    // additionally create a speaker-labelled TXT transcript after the MKV has
+    // been built successfully. If this final speaker transcript step fails,
+    // remove the MKV so the job remains atomic from the queue's perspective.
+    let speaker_transcript_path = if let Some(segments) = speaker_segments {
+        let path = unique_path(&output_dir, &format!("{}_transcribed", source_stem), "txt");
+        let transcript = match crate::speaker_diarization::build_speaker_transcript_from_whisper_json(
+            &json_path,
+            segments,
+        ) {
+            Ok(transcript) => transcript,
+            Err(error) => {
+                let _ = std::fs::remove_file(&destination);
+                let _ = std::fs::remove_file(&srt_path);
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = std::fs::write(&path, transcript) {
+            let _ = std::fs::remove_file(&destination);
+            let _ = std::fs::remove_file(&srt_path);
+            return Err(format!(
+                "Failed to write speaker-labelled transcript '{}': {error}",
+                path.display()
+            ));
+        }
+
+        Some(path)
+    } else {
+        None
+    };
+
     // External SRT is an optional future Output setting. For the V1 default,
     // the timing JSON and generated SRT are intermediate artifacts.
     for temporary in [&json_path, &srt_path] {
@@ -317,7 +391,12 @@ async fn finalize_video(
         &format!("Created subtitled video: {}", destination.display()),
     );
 
-    Ok(vec![file_name_string(&destination)?])
+    let mut outputs = vec![file_name_string(&destination)?];
+    if let Some(path) = speaker_transcript_path {
+        outputs.push(file_name_string(&path)?);
+    }
+
+    Ok(outputs)
 }
 
 async fn probe_audio_timeline_offset_ms(app: &AppHandle, source_path: &str) -> Result<i64, String> {

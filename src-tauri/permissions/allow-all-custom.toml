@@ -15,10 +15,13 @@ allow = [
   "start_job_queue",
   "cancel_queue_job",
 
+  "get_speaker_detection_status",
+
   "get_history_entries",
   "get_history_entry",
   "delete_history_entry",
   "clear_history",
+
 
   "check_build",
   "probe_media_file",

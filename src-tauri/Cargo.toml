@@ -42,6 +42,12 @@ encoding_rs = "0.8"
 sha2 = "0.10"
 keyring = "2.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+hound = "3.5"
+# Temporary upstream pin: the published 0.5.0 CUDA model loader can try to
+# open split-tail assets that its own ModelManager does not download.
+# Upstream master is 0.6.0 and uses an asset inventory/execution plan that
+# only loads model files which are actually present for the selected backend.
+speakrs = { git = "https://github.com/avencera/speakrs.git", branch = "master", features = ["cuda"] }
 
 [profile.release]
 lto = true
