@@ -870,26 +870,44 @@ fn open_in_linux_file_manager(target_path: &str) -> bool {
     false
 }
 
-fn resolve_output_path(file_path: &str, source_path: Option<&str>) -> Result<std::path::PathBuf, String> {
+fn output_path_candidates(
+    file_path: &str,
+    source_path: Option<&str>,
+) -> Result<Vec<std::path::PathBuf>, String> {
     let requested = std::path::PathBuf::from(file_path);
-    let resolved = if requested.is_absolute() {
-        requested
-    } else if let Some(source_path) = source_path {
-        let source = std::path::Path::new(source_path);
-        let source_parent = source
-            .parent()
-            .ok_or_else(|| format!("Couldn't determine the source folder for '{}'.", source_path))?;
-        let settings = load_settings_file();
-        crate::transcribe::resolve_output_dir(&settings, source_parent).join(&requested)
-    } else {
-        requested
-    };
-
-    if !resolved.exists() {
-        return Err(format!("Output file no longer exists: {}", resolved.display()));
+    if requested.is_absolute() {
+        return Ok(vec![requested]);
     }
 
-    Ok(std::fs::canonicalize(&resolved).unwrap_or(resolved))
+    let Some(source_path) = source_path else {
+        return Ok(vec![requested]);
+    };
+
+    let source = std::path::Path::new(source_path);
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| format!("Couldn't determine the source folder for '{}'.", source_path))?;
+    let settings = load_settings_file();
+
+    let mut candidates = vec![
+        crate::transcribe::resolve_output_dir(&settings, source_parent).join(&requested),
+        source_parent.join(&requested),
+    ];
+    candidates.dedup();
+    Ok(candidates)
+}
+
+fn resolve_output_path(file_path: &str, source_path: Option<&str>) -> Result<std::path::PathBuf, String> {
+    let candidates = output_path_candidates(file_path, source_path)?;
+    if let Some(found) = candidates.iter().find(|candidate| candidate.exists()) {
+        return Ok(std::fs::canonicalize(found).unwrap_or_else(|_| found.clone()));
+    }
+
+    let attempted = candidates
+        .first()
+        .cloned()
+        .unwrap_or_else(|| std::path::PathBuf::from(file_path));
+    Err(format!("Output file no longer exists: {}", attempted.display()))
 }
 
 #[tauri::command]
@@ -921,9 +939,27 @@ fn show_output_in_folder(
     app: AppHandle,
     file_path: String,
     source_path: Option<String>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let _ = &app;
-    let resolved = resolve_output_path(&file_path, source_path.as_deref())?;
+
+    let output = output_path_candidates(&file_path, source_path.as_deref())?
+        .into_iter()
+        .find(|candidate| candidate.exists());
+
+    let (resolved, revealed_kind) = if let Some(output) = output {
+        (std::fs::canonicalize(&output).unwrap_or(output), "output")
+    } else if let Some(source_path) = source_path.as_deref() {
+        let source = std::path::PathBuf::from(source_path);
+        if !source.exists() {
+            return Err(format!(
+                "Neither the output nor source file exists anymore: {}",
+                source.display()
+            ));
+        }
+        (std::fs::canonicalize(&source).unwrap_or(source), "source")
+    } else {
+        return Err("The output file no longer exists.".to_string());
+    };
 
     #[cfg(target_os = "windows")]
     {
@@ -931,8 +967,8 @@ fn show_output_in_folder(
             .arg("/select,")
             .arg(&resolved)
             .spawn()
-            .map_err(|error| format!("Failed to show output in Explorer: {error}"))?;
-        return Ok(());
+            .map_err(|error| format!("Failed to show file in Explorer: {error}"))?;
+        return Ok(revealed_kind.to_string());
     }
 
     #[cfg(target_os = "macos")]
@@ -941,8 +977,8 @@ fn show_output_in_folder(
             .arg("-R")
             .arg(&resolved)
             .spawn()
-            .map_err(|error| format!("Failed to show output in Finder: {error}"))?;
-        return Ok(());
+            .map_err(|error| format!("Failed to show file in Finder: {error}"))?;
+        return Ok(revealed_kind.to_string());
     }
 
     #[cfg(target_os = "linux")]
@@ -951,16 +987,114 @@ fn show_output_in_folder(
         let parent = resolved.parent().unwrap_or(&resolved);
         let parent_string = parent.to_string_lossy().to_string();
         if open_in_linux_file_manager(&parent_string) {
-            return Ok(());
+            return Ok(revealed_kind.to_string());
         }
-        return app
-            .opener()
+        app.opener()
             .open_path(&parent_string, None::<&str>)
-            .map_err(|e| format!("Failed to open output folder: {}", e));
+            .map_err(|e| format!("Failed to open file location: {}", e))?;
+        return Ok(revealed_kind.to_string());
     }
 
     #[allow(unreachable_code)]
-    Err("Showing an output in its folder is not supported on this platform.".to_string())
+    Err("Showing a file in its folder is not supported on this platform.".to_string())
+}
+
+#[tauri::command]
+async fn get_video_thumbnail(app: AppHandle, file_path: String) -> Result<String, String> {
+    let source = std::path::PathBuf::from(&file_path);
+    if !source.is_file() {
+        return Err("Video file no longer exists.".to_string());
+    }
+
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !VIDEO_EXTENSIONS.contains(&extension.as_str()) {
+        return Err("Thumbnail previews are only available for video files.".to_string());
+    }
+
+    let metadata = source
+        .metadata()
+        .map_err(|error| format!("Couldn't read video metadata: {error}"))?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    file_path.hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    modified.hash(&mut hasher);
+    let key = hasher.finish();
+
+    let thumbnail_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("Couldn't locate the thumbnail cache: {error}"))?
+        .join("video-thumbnails");
+    std::fs::create_dir_all(&thumbnail_dir)
+        .map_err(|error| format!("Couldn't create the thumbnail cache: {error}"))?;
+    let thumbnail = thumbnail_dir.join(format!("{key:016x}.jpg"));
+    if thumbnail.is_file() {
+        return Ok(thumbnail.to_string_lossy().to_string());
+    }
+
+    let ffmpeg = crate::ffmpeg_resolver::ensure_ffmpeg_available(Some(&app))?;
+    let source_for_worker = source.clone();
+    let thumbnail_for_worker = thumbnail.clone();
+
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        fn run_thumbnail(
+            ffmpeg: &std::path::Path,
+            source: &std::path::Path,
+            output: &std::path::Path,
+            seek: bool,
+        ) -> Result<(), String> {
+            let mut command = std::process::Command::new(ffmpeg);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x08000000);
+            }
+            command.arg("-hide_banner").arg("-loglevel").arg("error");
+            if seek {
+                command.arg("-ss").arg("00:00:01.000");
+            }
+            let status = command
+                .arg("-i")
+                .arg(source)
+                .arg("-frames:v")
+                .arg("1")
+                .arg("-vf")
+                .arg("scale=180:-2:force_original_aspect_ratio=decrease")
+                .arg("-q:v")
+                .arg("4")
+                .arg("-y")
+                .arg(output)
+                .status()
+                .map_err(|error| format!("Couldn't start the video thumbnailer: {error}"))?;
+            if status.success() && output.is_file() {
+                Ok(())
+            } else {
+                Err("FFmpeg couldn't extract a preview frame.".to_string())
+            }
+        }
+
+        if run_thumbnail(&ffmpeg, &source_for_worker, &thumbnail_for_worker, true).is_err() {
+            let _ = std::fs::remove_file(&thumbnail_for_worker);
+            run_thumbnail(&ffmpeg, &source_for_worker, &thumbnail_for_worker, false)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("Thumbnail worker failed: {error}"))??;
+
+    Ok(thumbnail.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -1409,6 +1543,7 @@ fn main() {
             copy_to_clipboard,
             open_file_in_editor,
             show_output_in_folder,
+            get_video_thumbnail,
             exit_app,
             hide_to_tray,
             set_window_zoom,

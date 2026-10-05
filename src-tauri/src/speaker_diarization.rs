@@ -45,6 +45,11 @@ struct CachedSpeakerPipeline {
 }
 
 static PIPELINE_CACHE: OnceLock<Mutex<Option<CachedSpeakerPipeline>>> = OnceLock::new();
+// Prefer speakrs' 2-second CUDA segmentation step for maximum throughput. If
+// that mode is not available or fails on a particular runtime, degrade once to
+// regular CUDA, then to CPU, without penalizing later files with repeated
+// failed initialization attempts.
+static CUDA_FAST_DISABLED_FOR_SESSION: AtomicBool = AtomicBool::new(false);
 static CUDA_DISABLED_FOR_SESSION: AtomicBool = AtomicBool::new(false);
 
 fn pipeline_cache() -> &'static Mutex<Option<CachedSpeakerPipeline>> {
@@ -215,8 +220,16 @@ pub fn get_speaker_detection_status(
 }
 
 fn execution_mode(settings: &crate::settings::WhisperSettings) -> ExecutionMode {
-    if settings.selected_backend.eq_ignore_ascii_case("CUDA") {
-        // 1-second segmentation step: prefer boundary accuracy over CudaFast.
+    if !settings.selected_backend.eq_ignore_ascii_case("CUDA") {
+        return ExecutionMode::Cpu;
+    }
+
+    if !CUDA_FAST_DISABLED_FOR_SESSION.load(Ordering::Acquire) {
+        // Maximum-throughput path: speakrs moves the segmentation window every
+        // ~2 seconds instead of ~1 second, substantially reducing the number of
+        // windows that must be scored on NVIDIA GPUs.
+        ExecutionMode::CudaFast
+    } else if !CUDA_DISABLED_FOR_SESSION.load(Ordering::Acquire) {
         ExecutionMode::Cuda
     } else {
         ExecutionMode::Cpu
@@ -381,6 +394,14 @@ fn diarize_samples_with_mode(
     ))
 }
 
+pub fn current_speaker_backend(settings: &crate::settings::WhisperSettings) -> String {
+    match execution_mode(settings).as_str() {
+        "cuda-fast" => "CUDA Fast".to_string(),
+        "cuda" => "CUDA".to_string(),
+        _ => "CPU".to_string(),
+    }
+}
+
 #[tauri::command]
 pub async fn warm_speaker_detection(
     models_dir: String,
@@ -403,16 +424,44 @@ pub async fn warm_speaker_detection(
             let _ = ensure_windows_cudnn_on_process_path();
         }
 
-        let primary_mode = if prefer_cuda {
-            ExecutionMode::Cuda
-        } else {
-            ExecutionMode::Cpu
-        };
-        let primary_mode_name = primary_mode.as_str().to_string();
+        if !prefer_cuda {
+            prepare_pipeline_with_mode(&cache_dir, ExecutionMode::Cpu)?;
+            return Ok("cpu".to_string());
+        }
 
-        match prepare_pipeline_with_mode(&cache_dir, primary_mode) {
-            Ok(()) => Ok(primary_mode_name),
-            Err(cuda_error) if prefer_cuda => {
+        // Fastest path first. A failure here does not disable CUDA entirely:
+        // regular 1-second CUDA remains a safe acceleration fallback.
+        if !CUDA_FAST_DISABLED_FOR_SESSION.load(Ordering::Acquire) {
+            match prepare_pipeline_with_mode(&cache_dir, ExecutionMode::CudaFast) {
+                Ok(()) => return Ok("cuda-fast".to_string()),
+                Err(fast_error) => {
+                    CUDA_FAST_DISABLED_FOR_SESSION.store(true, Ordering::Release);
+                    clear_pipeline_cache();
+
+                    match prepare_pipeline_with_mode(&cache_dir, ExecutionMode::Cuda) {
+                        Ok(()) => return Ok("cuda".to_string()),
+                        Err(cuda_error) => {
+                            CUDA_DISABLED_FOR_SESSION.store(true, Ordering::Release);
+                            clear_pipeline_cache();
+
+                            prepare_pipeline_with_mode(&cache_dir, ExecutionMode::Cpu).map_err(
+                                |cpu_error| {
+                                    format!(
+                                        "Speaker Detection warm-up failed on CUDA Fast ({fast_error}), CUDA ({cuda_error}), and CPU ({cpu_error})."
+                                    )
+                                },
+                            )?;
+
+                            return Ok("cpu".to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        match prepare_pipeline_with_mode(&cache_dir, ExecutionMode::Cuda) {
+            Ok(()) => Ok("cuda".to_string()),
+            Err(cuda_error) => {
                 CUDA_DISABLED_FOR_SESSION.store(true, Ordering::Release);
                 clear_pipeline_cache();
 
@@ -424,7 +473,6 @@ pub async fn warm_speaker_detection(
 
                 Ok("cpu".to_string())
             }
-            Err(error) => Err(error),
         }
     })
     .await
@@ -487,18 +535,13 @@ pub async fn run_speaker_diarization(
         );
     }
 
-    let effective_mode_name = if requested_mode_name.eq_ignore_ascii_case("cuda")
-        && CUDA_DISABLED_FOR_SESSION.load(Ordering::Acquire)
-    {
-        "cpu".to_string()
-    } else {
-        requested_mode_name.clone()
-    };
-
     logs.log(
         &app,
         "Speaker",
-        &format!("Starting speakrs PLDA + VBx diarization in {effective_mode_name} mode."),
+        &format!(
+            "Starting speakrs PLDA + VBx diarization in {} mode.",
+            requested_mode_name
+        ),
     );
 
     let _ = app.emit(
@@ -515,7 +558,7 @@ pub async fn run_speaker_diarization(
     let worker_logs = logs.clone();
     let worker_wav = wav_path.clone();
     let started = Instant::now();
-    let prefer_cuda = requested_mode_name.eq_ignore_ascii_case("cuda")
+    let prefer_cuda = requested_mode_name.starts_with("cuda")
         && !CUDA_DISABLED_FOR_SESSION.load(Ordering::Acquire);
 
     let segments = tokio::task::spawn_blocking(move || -> Result<Vec<SpeakerSegment>, String> {
@@ -552,21 +595,15 @@ pub async fn run_speaker_diarization(
             }
         }
 
-        let primary_mode = if prefer_cuda {
-            ExecutionMode::Cuda
-        } else {
-            ExecutionMode::Cpu
-        };
+        // Use the exact mode selected before entering the blocking worker so
+        // warm-up and actual diarization stay on the same cached pipeline.
+        let primary_mode = requested_mode;
 
         let _ = worker_app.emit(
             "transcribe-status",
             TranscribeProgress {
                 progress: 0.18,
-                message: if prefer_cuda {
-                    "Detecting speakers with CUDA + PLDA/VBx...".to_string()
-                } else {
-                    "Detecting speakers with CPU + PLDA/VBx...".to_string()
-                },
+                message: "Detecting speakers…".to_string(),
                 active: true,
                 stage: Some("diarizing".to_string()),
             },
@@ -574,7 +611,60 @@ pub async fn run_speaker_diarization(
 
         let mut converted = match diarize_samples_with_mode(&samples, &cache_dir, primary_mode) {
             Ok(segments) => segments,
-            Err(cuda_error) if prefer_cuda => {
+            Err(fast_error) if primary_mode.as_str() == "cuda-fast" => {
+                CUDA_FAST_DISABLED_FOR_SESSION.store(true, Ordering::Release);
+                clear_pipeline_cache();
+
+                worker_logs.log(
+                    &worker_app,
+                    "Speaker",
+                    &format!(
+                        "CUDA Fast Speaker Detection failed; retrying with regular CUDA for this app session: {fast_error}"
+                    ),
+                );
+                let _ = worker_app.emit(
+                    "transcribe-status",
+                    TranscribeProgress {
+                        progress: 0.18,
+                        message: "Speaker Detection is retrying…".to_string(),
+                        active: true,
+                        stage: Some("diarizing".to_string()),
+                    },
+                );
+
+                match diarize_samples_with_mode(&samples, &cache_dir, ExecutionMode::Cuda) {
+                    Ok(segments) => segments,
+                    Err(cuda_error) => {
+                        CUDA_DISABLED_FOR_SESSION.store(true, Ordering::Release);
+                        clear_pipeline_cache();
+
+                        worker_logs.log(
+                            &worker_app,
+                            "Speaker",
+                            &format!(
+                                "Regular CUDA Speaker Detection also failed; falling back to CPU for this app session: {cuda_error}"
+                            ),
+                        );
+                        let _ = worker_app.emit(
+                            "transcribe-status",
+                            TranscribeProgress {
+                                progress: 0.18,
+                                message: "Speaker Detection is retrying on CPU…".to_string(),
+                                active: true,
+                                stage: Some("diarizing".to_string()),
+                            },
+                        );
+
+                        diarize_samples_with_mode(&samples, &cache_dir, ExecutionMode::Cpu)
+                            .map_err(|cpu_error| {
+                                format!(
+                                    "Speaker Detection failed on CUDA Fast, CUDA, and CPU. CUDA Fast: {fast_error} | CUDA: {cuda_error} | CPU: {cpu_error}"
+                                )
+                            })?
+                    }
+                }
+            }
+            Err(cuda_error) if primary_mode.as_str() == "cuda" => {
                 CUDA_DISABLED_FOR_SESSION.store(true, Ordering::Release);
                 clear_pipeline_cache();
 
@@ -589,8 +679,7 @@ pub async fn run_speaker_diarization(
                     "transcribe-status",
                     TranscribeProgress {
                         progress: 0.18,
-                        message: "CUDA Speaker Detection unavailable — retrying on CPU..."
-                            .to_string(),
+                        message: "Speaker Detection is retrying on CPU…".to_string(),
                         active: true,
                         stage: Some("diarizing".to_string()),
                     },

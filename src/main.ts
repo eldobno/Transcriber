@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, ProgressBarStatus } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -31,6 +31,8 @@ type QueueJob = {
   speedFactor: number | null;
   conversionMs: number | null;
   diarizationMs: number | null;
+  speakerCount: number | null;
+  speakerBackend: string | null;
   transcriptionMs: number | null;
   finalizationMs: number | null;
   createdAtMs: number;
@@ -110,6 +112,16 @@ type SpeakerDetectionStatus = {
   embeddingModelFound: boolean;
   missing: string[];
 };
+
+type SystemSpecs = {
+  total_ram_gb: number;
+  cpu_cores: number;
+  gpu_type: string;
+  gpu_name: string;
+  is_discrete_gpu: boolean;
+};
+
+type SpeakerWarmState = "idle" | "warming" | "ready" | "error";
 
 type WhisperSettings = Record<string, any>;
 type AppView = "convert" | "history" | "settings";
@@ -199,11 +211,16 @@ type QueuePointerDrag = {
 let queuePointerDrag: QueuePointerDrag | null = null;
 let cancellingAll = false;
 let speakerWarmPromise: Promise<void> | null = null;
+let speakerWarmState: SpeakerWarmState = "idle";
+let speakerWarmBackend = "";
 let lastOverallProgress = 0;
 let displayedOverallPercent = 0;
 let progressPercentAnimation = 0;
 const lastJobProgress = new Map<string, number>();
+const videoThumbnailCache = new Map<string, string>();
+const videoThumbnailPending = new Map<string, Promise<string>>();
 let wasQueueRunning = false;
+const NETWORK_ACTIVITY_KEY = "transcriber:last-network-activity";
 
 const icons = {
   logo: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 13v-2M8.5 16V8M12 19V5M15.5 16V8M19 13v-2"/></svg>`,
@@ -249,9 +266,24 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           <button id="nav-history" class="nav-button" type="button"><span class="nav-icon">${icons.history}</span><span class="nav-label">History</span></button>
           <button id="nav-settings" class="nav-button" type="button"><span class="nav-icon">${icons.settings}</span><span class="nav-label">Settings</span></button>
         </nav>
-        <div class="sidebar-foot">
-          <span class="privacy-dot"></span>
-          <span>Runs locally</span>
+        <div class="sidebar-status-wrap">
+          <button id="local-status-button" class="sidebar-foot status-trigger" type="button" aria-expanded="false" aria-controls="health-popover">
+            <span class="privacy-dot"></span>
+            <span>Runs locally</span>
+          </button>
+          <div id="health-popover" class="health-popover" hidden>
+            <div class="health-head">
+              <div><strong>System status</strong><span>Transcriber health at a glance</span></div>
+              <button id="health-refresh" class="icon-action subtle" type="button" title="Refresh status" aria-label="Refresh status">↻</button>
+            </div>
+            <div class="health-list">
+              <div class="health-row"><span class="health-dot ready"></span><div><strong>Transcriber core</strong><span id="health-core">Running locally</span></div></div>
+              <div class="health-row"><span id="health-cuda-dot" class="health-dot"></span><div><strong>CUDA backend</strong><span id="health-cuda">Checking…</span></div></div>
+              <div class="health-row"><span id="health-speaker-dot" class="health-dot"></span><div><strong>Speaker Detection</strong><span id="health-speaker">Checking…</span></div></div>
+              <div class="health-row"><span id="health-network-dot" class="health-dot ready"></span><div><strong>Network</strong><span id="health-network">No recorded use</span></div></div>
+            </div>
+            <div class="health-note">Only network activity initiated by Transcriber is recorded here.</div>
+          </div>
         </div>
       </aside>
 
@@ -433,6 +465,15 @@ const settingsView = $("#settings-view") as HTMLElement;
 const convertNav = $("#nav-convert") as HTMLButtonElement;
 const historyNav = $("#nav-history") as HTMLButtonElement;
 const settingsNav = $("#nav-settings") as HTMLButtonElement;
+const localStatusButton = $("#local-status-button") as HTMLButtonElement;
+const healthPopover = $("#health-popover") as HTMLDivElement;
+const healthRefreshButton = $("#health-refresh") as HTMLButtonElement;
+const healthCuda = $("#health-cuda") as HTMLSpanElement;
+const healthCudaDot = $("#health-cuda-dot") as HTMLSpanElement;
+const healthSpeaker = $("#health-speaker") as HTMLSpanElement;
+const healthSpeakerDot = $("#health-speaker-dot") as HTMLSpanElement;
+const healthNetwork = $("#health-network") as HTMLSpanElement;
+const healthNetworkDot = $("#health-network-dot") as HTMLSpanElement;
 const dropZone = $("#drop-zone") as HTMLDivElement;
 const dragOverlay = $("#drag-overlay") as HTMLDivElement;
 const queuePanel = $("#queue-panel") as HTMLDivElement;
@@ -649,6 +690,62 @@ function mediaGlyph(fileName: string): string {
   return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h2m2-4v8m3-11v14m3-11v8m3-5v2m3-5v8"/></svg>`;
 }
 
+function mediaIconMarkup(fileName: string, sourcePath: string, small = false): string {
+  const video = isVideoName(fileName);
+  return `<div class="media-icon${small ? " small" : ""}${video ? " video-media-icon" : ""}"${video ? ` data-video-preview-path="${escapeHtml(sourcePath)}"` : ""}><span class="media-glyph">${mediaGlyph(fileName)}</span></div>`;
+}
+
+function attachVideoThumbnail(icon: HTMLElement, url: string) {
+  let image = icon.querySelector<HTMLImageElement>("img.media-thumbnail");
+  if (!image) {
+    image = document.createElement("img");
+    image.className = "media-thumbnail";
+    image.alt = "";
+    image.draggable = false;
+    icon.appendChild(image);
+  }
+  image.src = url;
+  icon.classList.add("thumbnail-ready");
+}
+
+async function ensureVideoThumbnail(icon: HTMLElement) {
+  const sourcePath = icon.dataset.videoPreviewPath;
+  if (!sourcePath || icon.classList.contains("thumbnail-ready")) return;
+
+  const cached = videoThumbnailCache.get(sourcePath);
+  if (cached) {
+    attachVideoThumbnail(icon, cached);
+    return;
+  }
+
+  let pending = videoThumbnailPending.get(sourcePath);
+  if (!pending) {
+    pending = invoke<string>("get_video_thumbnail", { filePath: sourcePath })
+      .then((path: string) => {
+        const url = convertFileSrc(path);
+        videoThumbnailCache.set(sourcePath, url);
+        return url;
+      })
+      .finally(() => videoThumbnailPending.delete(sourcePath));
+    videoThumbnailPending.set(sourcePath, pending);
+  }
+
+  try {
+    const url = await pending!;
+    if (icon.isConnected && icon.dataset.videoPreviewPath === sourcePath) attachVideoThumbnail(icon, url);
+  } catch {
+    icon.classList.add("thumbnail-unavailable");
+  }
+}
+
+function installVideoThumbnailHover(container: HTMLElement) {
+  container.addEventListener("pointerover", (event) => {
+    const icon = (event.target as HTMLElement).closest<HTMLElement>("[data-video-preview-path]");
+    if (!icon || icon.contains(event.relatedTarget as Node | null)) return;
+    void ensureVideoThumbnail(icon);
+  });
+}
+
 function renderLanguageOptions() {
   const html = LANGUAGE_OPTIONS.map(([value, label]) => `<option value="${value}">${label}</option>`).join("");
   languageSelect.innerHTML = html;
@@ -711,10 +808,12 @@ function renderModelStatus() {
 
 function speakerStatusText(compact = false): string {
   if (!settings?.speakerDetection) return compact ? "Off" : "Off by default";
-  if (speakerDetectionStatusError) return compact ? "Unavailable" : "Speaker Detection is unavailable";
+  if (speakerWarmState === "warming") return compact ? "Warming" : "Warming local speaker pipeline…";
+  if (speakerWarmState === "error" || speakerDetectionStatusError) return compact ? "Unavailable" : "Speaker Detection is unavailable";
   if (!speakerDetectionStatus) return compact ? "Checking" : "Checking local runtime…";
   if (speakerDetectionStatus.available) {
-    if (speakerDetectionStatus.missing.length > 0) return compact ? "On" : "Downloads what it needs on first use";
+    if (speakerDetectionStatus.missing.length > 0) return compact ? "Preparing" : "Downloads what it needs on first use";
+    if (speakerWarmState === "ready") return compact ? "Ready" : `Ready${speakerWarmBackend ? ` · ${speakerWarmBackend}` : ""} · speaker count is automatic`;
     return compact ? "On" : "Ready · speaker count is automatic";
   }
   return compact ? "Unavailable" : "Speaker Detection runtime is unavailable";
@@ -729,6 +828,93 @@ function renderSpeakerDetectionStatus() {
   settingsSpeakerDetectionCheckbox.disabled = queue.running;
   speakerStatus.textContent = speakerStatusText(true);
   settingsSpeakerStatus.textContent = speakerStatusText(false);
+}
+
+function recordNetworkActivity(reason: string) {
+  const value = JSON.stringify({ at: Date.now(), reason });
+  localStorage.setItem(NETWORK_ACTIVITY_KEY, value);
+  renderNetworkHealth();
+}
+
+function readNetworkActivity(): { at: number; reason: string } | null {
+  try {
+    const raw = localStorage.getItem(NETWORK_ACTIVITY_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!Number.isFinite(parsed?.at) || typeof parsed?.reason !== "string") return null;
+    return { at: parsed.at, reason: parsed.reason };
+  } catch {
+    return null;
+  }
+}
+
+function relativeTime(timestamp: number): string {
+  const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+  if (seconds < 10) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  return `${days}d ago`;
+}
+
+function renderNetworkHealth() {
+  const activity = readNetworkActivity();
+  healthNetwork.textContent = activity
+    ? `${activity.reason} · ${relativeTime(activity.at)}`
+    : "No recorded network use";
+  healthNetworkDot.className = "health-dot ready";
+}
+
+function renderSpeakerHealth() {
+  const enabled = Boolean(settings?.speakerDetection);
+  healthSpeakerDot.className = "health-dot";
+  if (!enabled) {
+    healthSpeaker.textContent = "Off";
+    healthSpeakerDot.classList.add("muted");
+    return;
+  }
+  if (speakerWarmState === "warming") {
+    healthSpeaker.textContent = "Warming local pipeline…";
+    healthSpeakerDot.classList.add("working");
+    return;
+  }
+  if (speakerWarmState === "error" || speakerDetectionStatusError || speakerDetectionStatus?.available === false) {
+    healthSpeaker.textContent = "Unavailable";
+    healthSpeakerDot.classList.add("error");
+    return;
+  }
+  healthSpeaker.textContent = speakerWarmState === "ready"
+    ? `Ready${speakerWarmBackend ? ` · ${speakerWarmBackend}` : ""}`
+    : "Ready on demand";
+  healthSpeakerDot.classList.add("ready");
+}
+
+async function refreshHealthPanel() {
+  healthRefreshButton.disabled = true;
+  renderNetworkHealth();
+  renderSpeakerHealth();
+  try {
+    const [cudaBuild, specs] = await Promise.all([
+      invoke<boolean>("check_build", { backend: "CUDA" }),
+      invoke<SystemSpecs>("get_system_specs"),
+    ]);
+    const gpuReady = cudaBuild && specs.is_discrete_gpu && !/cpu only/i.test(specs.gpu_name);
+    healthCuda.textContent = gpuReady ? `Ready · ${specs.gpu_name}` : cudaBuild ? "CUDA build available · GPU not detected" : "CUDA build unavailable";
+    healthCudaDot.className = `health-dot ${gpuReady ? "ready" : "error"}`;
+  } catch (error) {
+    healthCuda.textContent = "Couldn't read CUDA status";
+    healthCudaDot.className = "health-dot error";
+  } finally {
+    healthRefreshButton.disabled = false;
+  }
+}
+
+function closeHealthPopover() {
+  healthPopover.hidden = true;
+  localStatusButton.setAttribute("aria-expanded", "false");
 }
 
 function renderSettings() {
@@ -801,8 +987,13 @@ async function setSpeakerDetection(enabled: boolean) {
   settings.speakerCount = 0;
   await persistSettings();
   await refreshSpeakerDetectionStatus();
+  if (!enabled) {
+    speakerWarmState = "idle";
+    speakerWarmBackend = "";
+  }
   renderQueue();
-  if (enabled && queue.jobs.length > 0) void warmSpeakerDetection();
+  renderSpeakerHealth();
+  if (enabled) void warmSpeakerDetection();
 }
 
 function referenceSpeed(): number {
@@ -931,12 +1122,16 @@ function renderQueue() {
       const previousProgress = lastJobProgress.get(job.id) ?? 0;
       lastJobProgress.set(job.id, progress);
 
+      const speakerDetail = job.speakerCount !== null && job.speakerCount > 0
+        ? `${job.speakerCount} speaker${job.speakerCount === 1 ? "" : "s"}`
+        : "";
+      const speakerBackendDetail = speakerDetail && job.speakerBackend ? `${speakerDetail} · ${job.speakerBackend}` : speakerDetail;
       const timing = active && activeMetrics
-        ? `${activeMetrics.speedFactor.toFixed(1)}× realtime · ${formatDuration(activeMetrics.etaSec)} left`
+        ? [speakerBackendDetail, `${activeMetrics.speedFactor.toFixed(1)}× realtime`, `${formatDuration(activeMetrics.etaSec)} left`].filter(Boolean).join(" · ")
         : job.status === "completed"
-          ? [job.durationMs !== null ? `Done in ${formatDurationMs(job.durationMs)}` : "Done", job.speedFactor ? `${job.speedFactor.toFixed(1)}× realtime` : ""].filter(Boolean).join(" · ")
-          : job.durationSec > 0 ? formatDuration(job.durationSec) : "";
-      const message = active ? activeMessage : job.message ?? "";
+          ? [job.durationMs !== null ? `Done in ${formatDurationMs(job.durationMs)}` : "Done", job.speedFactor ? `${job.speedFactor.toFixed(1)}× realtime` : "", speakerBackendDetail].filter(Boolean).join(" · ")
+          : [job.durationSec > 0 ? formatDuration(job.durationSec) : "", speakerBackendDetail].filter(Boolean).join(" · ");
+      const message = active ? (activeMessage || job.message || "") : job.message ?? "";
       const output = job.outputFiles[0];
       const canReorder = canMove(job) && !queue.running;
 
@@ -945,7 +1140,7 @@ function renderQueue() {
           <div class="drag-slot">
             ${canReorder ? `<span class="drag-handle" data-drag-job-id="${escapeHtml(job.id)}" title="Hold and drag to reorder" aria-label="Hold and drag to reorder">${icons.grip}</span>` : `<span class="drag-handle-placeholder"></span>`}
           </div>
-          <div class="media-icon">${mediaGlyph(job.fileName)}</div>
+          ${mediaIconMarkup(job.fileName, job.sourcePath)}
           <div class="queue-file">
             <div class="queue-file-top">
               <strong title="${escapeHtml(job.sourcePath)}">${escapeHtml(job.fileName)}</strong>
@@ -985,12 +1180,17 @@ function renderQueue() {
       target = overallPercent;
       const terminalCount = completed + failed + cancelled;
       const currentNumber = Math.min(terminalCount + 1, queue.jobs.length);
+      const focusStage = activeMessage || (activeJob ? statusLabel(activeJob.status) : "Processing queue");
       dockProgressLabel.textContent = activeJob
-        ? `${statusLabel(activeJob.status)} ${currentNumber} of ${queue.jobs.length} · ${activeJob.fileName}`
+        ? `${focusStage} · ${currentNumber} of ${queue.jobs.length} · ${activeJob.fileName}`
         : "Processing queue";
+      const activeSpeakerDetail = activeJob?.speakerCount
+        ? `${activeJob.speakerCount} speaker${activeJob.speakerCount === 1 ? "" : "s"}${activeJob.speakerBackend ? ` · ${activeJob.speakerBackend}` : ""}`
+        : "";
       dockProgressDetail.textContent = [
         eta !== null ? `${formatDuration(eta)} remaining` : "Estimating time…",
         activeMetrics?.speedFactor ? `${activeMetrics.speedFactor.toFixed(1)}× realtime` : "",
+        activeSpeakerDetail,
       ].filter(Boolean).join(" · ");
     } else {
       const terminalCount = completed + failed + cancelled;
@@ -1114,7 +1314,7 @@ function renderHistory() {
 
     return `
       <article class="history-row">
-        <div class="media-icon small">${mediaGlyph(entry.fileName)}</div>
+        ${mediaIconMarkup(entry.fileName, entry.sourcePath, true)}
         <div class="history-copy">
           <div class="history-topline">
             <strong>${escapeHtml(entry.fileName)}</strong>
@@ -1169,19 +1369,33 @@ async function warmSpeakerDetection() {
   const backend = settings.selectedBackend === "Standard" ? "Standard" : "CUDA";
   if (!modelsDir) return;
 
+  speakerWarmState = "warming";
+  speakerWarmBackend = "";
+  renderSpeakerDetectionStatus();
+  renderSpeakerHealth();
+
+  if ((speakerDetectionStatus?.missing.length ?? 0) > 0) {
+    recordNetworkActivity("Speaker model setup");
+  }
+
   speakerWarmPromise = (async () => {
     const started = performance.now();
     try {
-      await invoke<string>("warm_speaker_detection", { modelsDir, backend });
+      const warmedBackend = await invoke<string>("warm_speaker_detection", { modelsDir, backend });
+      speakerWarmState = "ready";
+      speakerWarmBackend = warmedBackend.toUpperCase();
       await refreshSpeakerDetectionStatus();
       if (performance.now() - started > 700) {
         showToast("Speaker Detection is ready.", "success", 2200);
       }
     } catch (error) {
-      console.warn("Speaker Detection warm-up failed; conversion will retry normally.", error);
-      showToast("Speaker Detection will initialize when conversion starts.", "warning", 3600);
+      speakerWarmState = "error";
+      speakerWarmBackend = "";
+      showToast("Speaker Detection will retry when conversion starts.", "warning", 3600);
     } finally {
       speakerWarmPromise = null;
+      renderSpeakerDetectionStatus();
+      renderSpeakerHealth();
     }
   })();
 
@@ -1207,7 +1421,7 @@ async function addPathsToQueue(paths: string[]) {
 
     if (result.alreadyProcessedPaths.length) {
       const count = result.alreadyProcessedPaths.length;
-      showToast(`${count} already converted ${count === 1 ? "file was" : "files were"} skipped.`, "info", 2800);
+      showToast(`${count} already converted/generated ${count === 1 ? "file was" : "files were"} skipped.`, "info", 3000);
     }
 
     if (result.ignoredPaths.length) {
@@ -1265,6 +1479,7 @@ async function startModelDownload() {
       error: null,
     };
     renderModelStatus();
+    recordNetworkActivity(`Model download · ${selectedModel}`);
     await invoke("start_download_model_task", {
       modelsDir: settings.modelsDir,
       modelName: selectedModel,
@@ -1306,12 +1521,15 @@ async function openPath(path: string, sourcePath?: string) {
 
 async function revealPath(path: string, sourcePath?: string) {
   try {
-    await invoke("show_output_in_folder", {
+    const revealed = await invoke<string>("show_output_in_folder", {
       filePath: path,
       sourcePath: sourcePath || null,
     });
+    if (revealed === "source") {
+      showToast("Output is missing — opened the source location instead.", "info", 3400);
+    }
   } catch (error) {
-    showToast(`Couldn't show output in folder: ${String(error)}`, "error", 5000);
+    showToast(`Couldn't show that file location: ${String(error)}`, "error", 5000);
   }
 }
 
@@ -1331,14 +1549,7 @@ function shouldHandleDrop(paths: string[]): boolean {
 }
 
 async function setupDragAndDrop() {
-  console.info("[dragdrop/frontend] setup starting");
-
-  // PRIMARY PATH: the Rust webview bridge. This is the exact mechanism that
-  // existed in the previously working Transcriber source. It listens at the
-  // Tauri WebviewEvent layer and emits small app events with real filesystem
-  // paths, avoiding WebView2/Tauri JS drag/drop quirks on Windows.
   await listen<boolean>("transcriber-native-drag-enter", (event) => {
-    console.info("[dragdrop/frontend] rust bridge enter", event.payload);
     if (activeView !== "convert" || queue.running || queuePointerDrag) {
       setDragVisual(false);
       return;
@@ -1348,83 +1559,52 @@ async function setupDragAndDrop() {
 
   await listen<string[]>("transcriber-native-file-drop", async (event) => {
     const paths = event.payload ?? [];
-    console.info("[dragdrop/frontend] rust bridge drop", paths);
     setDragVisual(false);
-
-    if (activeView !== "convert" || queue.running || queuePointerDrag) {
-      console.info("[dragdrop/frontend] rust bridge drop ignored", {
-        activeView,
-        queueRunning: queue.running,
-        queuePointerDrag: Boolean(queuePointerDrag),
-      });
-      return;
-    }
-
-    if (paths.length && shouldHandleDrop(paths)) {
-      await addPathsToQueue(paths);
-    }
+    if (activeView !== "convert" || queue.running || queuePointerDrag) return;
+    if (paths.length && shouldHandleDrop(paths)) await addPathsToQueue(paths);
   });
 
-  // SECONDARY/FALLBACK PATH: Tauri's current Webview API. Keeping this
-  // instrumented means the terminal + DevTools will tell us exactly which
-  // layer is firing on this machine.
   try {
     const webview = getCurrentWebview();
     await webview.onDragDropEvent(async (event) => {
       const payload = event.payload;
-      console.info("[dragdrop/frontend] webview event", payload.type, payload);
-
       if (activeView !== "convert" || queue.running || queuePointerDrag) {
         setDragVisual(false);
         return;
       }
-
       if (payload.type === "enter" || payload.type === "over") {
         setDragVisual(true);
         return;
       }
-
       if (payload.type === "leave") {
         setDragVisual(false);
         return;
       }
-
       const paths = payload.paths ?? [];
       setDragVisual(false);
-      if (paths.length && shouldHandleDrop(paths)) {
-        await addPathsToQueue(paths);
-      }
+      if (paths.length && shouldHandleDrop(paths)) await addPathsToQueue(paths);
     });
-  } catch (error) {
-    console.error("[dragdrop/frontend] webview listener setup failed", error);
+  } catch {
+    // The Rust bridge above remains the primary Windows path.
   }
 
-  // Browser events are diagnostic/prevent-navigation only. They do not provide
-  // dependable Windows filesystem paths in WebView2.
   document.addEventListener("dragenter", (event) => {
-    console.info("[dragdrop/frontend] browser dragenter", event.dataTransfer?.types ?? []);
     if (activeView !== "convert" || queue.running || queuePointerDrag) return;
     event.preventDefault();
     setDragVisual(true);
   });
-
   document.addEventListener("dragover", (event) => {
     if (activeView !== "convert" || queue.running || queuePointerDrag) return;
     event.preventDefault();
   });
-
   document.addEventListener("dragleave", (event) => {
     if (!event.relatedTarget && !queuePointerDrag) setDragVisual(false);
   });
-
   document.addEventListener("drop", (event) => {
-    console.info("[dragdrop/frontend] browser drop", event.dataTransfer?.files?.length ?? 0);
     if (activeView !== "convert" || queue.running || queuePointerDrag) return;
     event.preventDefault();
     setDragVisual(false);
   });
-
-  console.info("[dragdrop/frontend] setup complete");
 }
 
 function setupWindowControls() {
@@ -1458,7 +1638,7 @@ async function initialize() {
   await refreshSpeakerDetectionStatus();
   await refreshQueue();
   wasQueueRunning = queue.running;
-  if (loadedSettings.speakerDetection && queue.jobs.length > 0) void warmSpeakerDetection();
+  if (loadedSettings.speakerDetection) void warmSpeakerDetection();
   renderSettings();
   setupMicroInteractions();
   animateViewIn(convertView);
@@ -1526,7 +1706,27 @@ await listen<TranscribeProgress>("transcribe-status", (event: { payload: Transcr
 });
 
 setupWindowControls();
-void setupDragAndDrop().catch((error) => console.error("Drag/drop setup failed", error));
+void setupDragAndDrop().catch(() => showToast("Drag and drop couldn't initialize.", "warning", 4200));
+
+localStatusButton.addEventListener("click", (event) => {
+  event.stopPropagation();
+  const opening = healthPopover.hidden;
+  healthPopover.hidden = !opening;
+  localStatusButton.setAttribute("aria-expanded", opening ? "true" : "false");
+  if (opening) void refreshHealthPanel();
+});
+healthRefreshButton.addEventListener("click", (event) => {
+  event.stopPropagation();
+  void refreshHealthPanel();
+});
+document.addEventListener("pointerdown", (event) => {
+  if (healthPopover.hidden) return;
+  const target = event.target as Node;
+  if (!healthPopover.contains(target) && !localStatusButton.contains(target)) closeHealthPopover();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeHealthPopover();
+});
 
 convertNav.addEventListener("click", () => void showView("convert"));
 historyNav.addEventListener("click", () => void showView("history"));
@@ -1795,6 +1995,9 @@ historyContainer.addEventListener("click", async (event) => {
   }
 });
 
+installVideoThumbnailHover(jobsContainer);
+installVideoThumbnailHover(historyContainer);
+
 outputModeSelect.addEventListener("change", async () => {
   if (!settings) return;
   settings.outputDirMode = outputModeSelect.value;
@@ -1842,7 +2045,6 @@ document.addEventListener("contextmenu", (event) => {
 });
 
 initialize().catch((error) => {
-  console.error(error);
   showToast(`Transcriber couldn't start: ${String(error)}`);
   document.documentElement.classList.add("ready");
 });

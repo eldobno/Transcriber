@@ -47,6 +47,8 @@ pub struct QueueJob {
     pub speed_factor: Option<f64>,
     pub conversion_ms: Option<u64>,
     pub diarization_ms: Option<u64>,
+    pub speaker_count: Option<usize>,
+    pub speaker_backend: Option<String>,
     pub transcription_ms: Option<u64>,
     pub finalization_ms: Option<u64>,
     pub created_at_ms: u64,
@@ -143,6 +145,30 @@ fn is_supported_media(path: &str) -> bool {
 
     crate::AUDIO_EXTENSIONS.contains(&extension.as_str())
         || crate::VIDEO_EXTENSIONS.contains(&extension.as_str())
+}
+
+/// Transcriber creates soft-subtitled video outputs as MKV files with the
+/// "(Subbed)" marker in the filename. Treat those files as generated outputs
+/// rather than fresh source media. This intentionally catches renamed/copy
+/// variants too, e.g. "Movie (Subbed) - Copy.mkv" and
+/// "Movie (Subbed) (2).mkv", so recursively adding a folder cannot feed
+/// Transcriber's own outputs back into the queue.
+fn is_transcriber_generated_video_output(path: &str) -> bool {
+    let path = Path::new(path);
+
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+
+    if !extension.eq_ignore_ascii_case("mkv") {
+        return false;
+    }
+
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.to_lowercase().contains("(subbed)"))
+        .unwrap_or(false)
 }
 
 fn collect_input_path(
@@ -360,7 +386,14 @@ pub async fn add_job_queue_files(
     for path in paths {
         let key = path_key(&path);
 
-        if processed_sources.contains(&key) || known_outputs.contains(&key) {
+        // First reject our own generated video outputs by their stable naming
+        // marker. History/path matching alone is not enough because Windows can
+        // rename copies (" - Copy", "(2)", etc.), producing a different path
+        // that still points to a Transcriber-generated subtitled video.
+        if is_transcriber_generated_video_output(&path)
+            || processed_sources.contains(&key)
+            || known_outputs.contains(&key)
+        {
             already_processed_paths.push(path);
             continue;
         }
@@ -405,6 +438,8 @@ pub async fn add_job_queue_files(
                 speed_factor: None,
                 conversion_ms: None,
                 diarization_ms: None,
+                speaker_count: None,
+                speaker_backend: None,
                 transcription_ms: None,
                 finalization_ms: None,
                 created_at_ms: now_ms(),
@@ -788,6 +823,8 @@ pub async fn start_job_queue(
             job.speed_factor = None;
             job.conversion_ms = None;
             job.diarization_ms = None;
+            job.speaker_count = None;
+            job.speaker_backend = None;
             job.transcription_ms = None;
             job.finalization_ms = None;
 
@@ -953,7 +990,32 @@ pub async fn start_job_queue(
             }
 
             match diarization_result {
-                Ok(segments) => Some(segments),
+                Ok(segments) => {
+                    let speaker_count = segments
+                        .iter()
+                        .map(|segment| segment.speaker)
+                        .max()
+                        .map(|speaker| speaker + 1)
+                        .unwrap_or(0);
+                    let speaker_backend =
+                        crate::speaker_diarization::current_speaker_backend(&job_settings);
+
+                    let mut queue = queue_state
+                        .lock()
+                        .map_err(|error| format!("Queue lock error: {error}"))?;
+                    if let Some(job) = queue.jobs.iter_mut().find(|job| job.id == job_id) {
+                        job.speaker_count = Some(speaker_count);
+                        job.speaker_backend = Some(speaker_backend);
+                        job.message = Some(format!(
+                            "{speaker_count} speaker{} detected",
+                            if speaker_count == 1 { "" } else { "s" }
+                        ));
+                    }
+                    emit_queue(&app, &queue);
+                    drop(queue);
+
+                    Some(segments)
+                }
                 Err(error) => {
                     // Whisper normally owns temporary WAV cleanup. If speaker
                     // detection fails before Whisper starts, clean it here.
@@ -1012,7 +1074,13 @@ pub async fn start_job_queue(
                 } else {
                     job.status = JobStatus::Transcribing;
                     job.progress = 0.0;
-                    job.message = Some("Transcribing".to_string());
+                    job.message = Some(match job.speaker_count {
+                        Some(count) if count > 0 => format!(
+                            "{count} speaker{} · Transcribing",
+                            if count == 1 { "" } else { "s" }
+                        ),
+                        _ => "Transcribing".to_string(),
+                    });
                     false
                 }
             } else {
@@ -1210,4 +1278,35 @@ pub async fn start_job_queue(
     logs.log(&app, "Queue", &format!("Queue finished: {body}"));
 
     Ok(final_snapshot)
+}
+
+#[cfg(test)]
+mod generated_output_dedup_tests {
+    use super::is_transcriber_generated_video_output;
+
+    #[test]
+    fn recognizes_transcriber_subbed_mkv_variants() {
+        assert!(is_transcriber_generated_video_output(
+            r"C:\Media\Movie (Subbed).mkv"
+        ));
+        assert!(is_transcriber_generated_video_output(
+            r"C:\Media\Movie (Subbed) (2) - Copy.mkv"
+        ));
+        assert!(is_transcriber_generated_video_output(
+            r"C:\Media\Movie (SUBBED) (Subbed) - Copy.MKV"
+        ));
+    }
+
+    #[test]
+    fn does_not_flag_normal_media_or_non_mkv_files() {
+        assert!(!is_transcriber_generated_video_output(
+            r"C:\Media\Movie.mkv"
+        ));
+        assert!(!is_transcriber_generated_video_output(
+            r"C:\Media\Movie (Subbed).mp4"
+        ));
+        assert!(!is_transcriber_generated_video_output(
+            r"C:\Media\meeting.wav"
+        ));
+    }
 }

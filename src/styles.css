@@ -1830,3 +1830,160 @@ textarea,
     animation: none !important;
   }
 }
+
+/* --- v4.7: local health popover + hover video thumbnails --- */
+.sidebar-status-wrap {
+  margin-top: auto;
+  position: relative;
+}
+
+.sidebar-foot.status-trigger {
+  width: 100%;
+  margin-top: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  transition: background 140ms ease, color 140ms ease;
+}
+
+.sidebar-foot.status-trigger:hover,
+.sidebar-foot.status-trigger[aria-expanded="true"] {
+  color: #aeb7c2;
+  background: rgba(255,255,255,.028);
+}
+
+.health-popover {
+  position: fixed;
+  left: calc(var(--sidebar-w) + 9px);
+  bottom: 16px;
+  width: 306px;
+  z-index: 1200;
+  padding: 13px;
+  border: 1px solid rgba(119, 136, 155, .18);
+  border-radius: 12px;
+  background: rgba(15, 19, 24, .985);
+  box-shadow: 0 18px 58px rgba(0,0,0,.46), inset 0 1px 0 rgba(255,255,255,.025);
+  backdrop-filter: blur(18px);
+  transform-origin: left bottom;
+  animation: health-pop-in 150ms cubic-bezier(.2,.8,.2,1);
+}
+
+@keyframes health-pop-in {
+  from { opacity: 0; transform: translateY(5px) scale(.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.health-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 1px 1px 9px;
+  border-bottom: 1px solid rgba(255,255,255,.055);
+}
+
+.health-head > div { min-width: 0; display: grid; gap: 2px; }
+.health-head strong { color: #eef3f8; font-size: 12.5px; font-weight: 650; }
+.health-head span { color: #6f7a87; font-size: 10.5px; }
+.health-head .icon-action { width: 27px; height: 27px; font-size: 15px; }
+
+.health-list { display: grid; gap: 4px; padding: 9px 0 4px; }
+.health-row {
+  min-height: 42px;
+  display: grid;
+  grid-template-columns: 9px minmax(0,1fr);
+  align-items: center;
+  gap: 9px;
+  padding: 5px 7px;
+  border-radius: 8px;
+}
+.health-row:hover { background: rgba(255,255,255,.022); }
+.health-row > div { min-width: 0; display: grid; gap: 2px; }
+.health-row strong { color: #d8dee6; font-size: 11.5px; font-weight: 600; }
+.health-row span:not(.health-dot) {
+  overflow: hidden;
+  color: #7d8997;
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.health-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #65707d;
+  box-shadow: 0 0 0 3px rgba(101,112,125,.07);
+}
+.health-dot.ready { background: #5cc38b; box-shadow: 0 0 0 3px rgba(92,195,139,.075), 0 0 10px rgba(92,195,139,.16); }
+.health-dot.working { background: #42c3d9; box-shadow: 0 0 0 3px rgba(66,195,217,.07), 0 0 12px rgba(66,195,217,.22); animation: health-dot-pulse 1.25s ease-in-out infinite; }
+.health-dot.error { background: #db747d; box-shadow: 0 0 0 3px rgba(219,116,125,.075); }
+.health-dot.muted { background: #555f6b; box-shadow: none; }
+
+.health-note {
+  padding: 8px 7px 1px;
+  border-top: 1px solid rgba(255,255,255,.045);
+  color: #56616e;
+  font-size: 9.5px;
+  line-height: 1.45;
+}
+
+@keyframes health-dot-pulse {
+  0%, 100% { opacity: .68; transform: scale(.92); }
+  50% { opacity: 1; transform: scale(1.08); }
+}
+
+.video-media-icon {
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+}
+
+.media-glyph {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  transition: opacity 160ms ease, transform 180ms cubic-bezier(.2,.8,.2,1);
+}
+
+.media-thumbnail {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0;
+  transform: scale(1.06);
+  filter: saturate(.88) contrast(1.03) brightness(.86);
+  transition: opacity 170ms ease, transform 260ms cubic-bezier(.2,.8,.2,1), filter 170ms ease;
+  pointer-events: none;
+}
+
+.video-media-icon.thumbnail-ready:hover .media-thumbnail {
+  opacity: 1;
+  transform: scale(1);
+  filter: saturate(.96) contrast(1.04) brightness(.92);
+}
+
+.video-media-icon.thumbnail-ready:hover .media-glyph {
+  opacity: 0;
+  transform: scale(.86);
+}
+
+.video-media-icon.thumbnail-ready:hover {
+  box-shadow: inset 0 0 0 1px rgba(127,169,197,.22), 0 5px 15px rgba(0,0,0,.18);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .health-popover,
+  .health-dot.working,
+  .media-glyph,
+  .media-thumbnail {
+    animation: none !important;
+    transition: none !important;
+  }
+}

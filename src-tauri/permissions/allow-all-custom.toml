@@ -67,6 +67,7 @@ allow = [
   "copy_to_clipboard",
   "open_file_in_editor",
   "show_output_in_folder",
+  "get_video_thumbnail",
   "exit_app",
   "hide_to_tray",
   "set_window_zoom"
