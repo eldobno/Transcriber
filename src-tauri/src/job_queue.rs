@@ -85,6 +85,7 @@ pub struct JobQueueSnapshot {
 pub struct AddJobsResult {
     pub queue: JobQueueSnapshot,
     pub ignored_paths: Vec<String>,
+    pub already_processed_paths: Vec<String>,
 }
 
 fn now_ms() -> u64 {
@@ -220,6 +221,71 @@ fn expand_input_paths(paths: Vec<String>) -> (Vec<String>, Vec<String>) {
     (media_paths, ignored_paths)
 }
 
+fn file_modified_ms(path: &Path) -> Option<u64> {
+    path.metadata()
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u64)
+}
+
+fn resolve_history_output_path(
+    output: &str,
+    source_path: &str,
+    settings: &crate::settings::WhisperSettings,
+) -> PathBuf {
+    let output_path = PathBuf::from(output);
+    if output_path.is_absolute() {
+        return output_path;
+    }
+
+    let source = Path::new(source_path);
+    let source_parent = source.parent().unwrap_or_else(|| Path::new("."));
+    crate::transcribe::resolve_output_dir(settings, source_parent).join(output_path)
+}
+
+fn completed_history_dedup_index(
+    history: &crate::history::HistoryState,
+) -> (HashSet<String>, HashSet<String>) {
+    let settings = crate::settings::load_settings_file();
+    let entries = history.entries(10_000, 0).unwrap_or_default();
+    let mut processed_sources = HashSet::new();
+    let mut known_outputs = HashSet::new();
+
+    for entry in entries.into_iter().filter(|entry| entry.status == "completed") {
+        let existing_outputs = entry
+            .output_files
+            .iter()
+            .map(|output| resolve_history_output_path(output, &entry.source_path, &settings))
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+
+        if existing_outputs.is_empty() {
+            continue;
+        }
+
+        for output in existing_outputs {
+            known_outputs.insert(path_key(&output.to_string_lossy()));
+        }
+
+        // Skip the source only while it still looks like the exact file that was
+        // completed. If it has been modified since then, allow it through so the
+        // user can intentionally re-transcribe the newer media.
+        if let (Some(completed_at_ms), Some(modified_at_ms)) = (
+            entry.completed_at_ms,
+            file_modified_ms(Path::new(&entry.source_path)),
+        ) {
+            if modified_at_ms <= completed_at_ms.saturating_add(2_000) {
+                processed_sources.insert(path_key(&entry.source_path));
+            }
+        }
+    }
+
+    (processed_sources, known_outputs)
+}
+
 fn history_context(
     job: &QueueJob,
     settings: &crate::settings::WhisperSettings,
@@ -284,12 +350,20 @@ pub fn get_job_queue(state: State<'_, JobQueueState>) -> Result<JobQueueSnapshot
 pub async fn add_job_queue_files(
     app: AppHandle,
     state: State<'_, JobQueueState>,
+    history_state: State<'_, crate::history::HistoryState>,
     paths: Vec<String>,
 ) -> Result<AddJobsResult, String> {
     let (paths, ignored_paths) = expand_input_paths(paths);
+    let (processed_sources, known_outputs) = completed_history_dedup_index(&history_state);
+    let mut already_processed_paths = Vec::new();
 
     for path in paths {
         let key = path_key(&path);
+
+        if processed_sources.contains(&key) || known_outputs.contains(&key) {
+            already_processed_paths.push(path);
+            continue;
+        }
 
         let job_id = {
             let mut queue = state
@@ -388,6 +462,7 @@ pub async fn add_job_queue_files(
     Ok(AddJobsResult {
         queue: snapshot(&queue),
         ignored_paths,
+        already_processed_paths,
     })
 }
 
@@ -543,6 +618,73 @@ pub async fn cancel_queue_job(
         // the queue still looks active but the shared transcription session has
         // already returned to Idle. In that case the queue-level cancellation
         // flag is enough; start_job_queue checks it before starting Whisper.
+        if let Err(error) = crate::cancel_transcription_session(session_state.0.clone()).await {
+            if !error.contains("No active transcription or translation session") {
+                return Err(error);
+            }
+        }
+    }
+
+    let queue = state
+        .0
+        .lock()
+        .map_err(|error| format!("Queue lock error: {error}"))?;
+
+    Ok(snapshot(&queue))
+}
+
+
+#[tauri::command]
+pub async fn cancel_job_queue(
+    app: AppHandle,
+    state: State<'_, JobQueueState>,
+    session_state: State<'_, crate::TranscriptionState>,
+    log_state: State<'_, crate::LogState>,
+    history_state: State<'_, crate::history::HistoryState>,
+) -> Result<JobQueueSnapshot, String> {
+    let (should_cancel_session, terminal_jobs) = {
+        let mut queue = state
+            .0
+            .lock()
+            .map_err(|error| format!("Queue lock error: {error}"))?;
+
+        let mut should_cancel_session = false;
+        let mut terminal_jobs = Vec::new();
+
+        for job in &mut queue.jobs {
+            match job.status {
+                JobStatus::Inspecting | JobStatus::Ready | JobStatus::Queued => {
+                    if !job.cancel_requested {
+                        job.cancel_requested = true;
+                        job.status = JobStatus::Cancelled;
+                        job.progress = 0.0;
+                        job.message = Some("Cancelled".to_string());
+                        job.error = None;
+                        job.completed_at_ms = Some(now_ms());
+                        terminal_jobs.push(job.clone());
+                    }
+                }
+                JobStatus::Converting | JobStatus::Transcribing | JobStatus::Finalizing => {
+                    job.cancel_requested = true;
+                    job.message = Some("Cancelling...".to_string());
+                    should_cancel_session = true;
+                }
+                JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled => {}
+            }
+        }
+
+        emit_queue(&app, &queue);
+        (should_cancel_session, terminal_jobs)
+    };
+
+    if !terminal_jobs.is_empty() {
+        let settings = crate::settings::load_settings_file();
+        for job in &terminal_jobs {
+            record_history_finished(&app, &log_state.0, &history_state, job, &settings);
+        }
+    }
+
+    if should_cancel_session {
         if let Err(error) = crate::cancel_transcription_session(session_state.0.clone()).await {
             if !error.contains("No active transcription or translation session") {
                 return Err(error);
@@ -785,7 +927,7 @@ pub async fn start_job_queue(
         // preserving the selected model/backend and transcription options.
 
         // ----------------------------------------------------
-        // Optional Speaker Detection (Beta)
+        // Optional Speaker Detection
         // ----------------------------------------------------
         // Reuse the exact 16 kHz mono WAV that Whisper is about to consume.
         // This keeps diarization and Whisper word timestamps on the same audio

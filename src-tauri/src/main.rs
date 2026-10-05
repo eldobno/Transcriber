@@ -870,21 +870,97 @@ fn open_in_linux_file_manager(target_path: &str) -> bool {
     false
 }
 
+fn resolve_output_path(file_path: &str, source_path: Option<&str>) -> Result<std::path::PathBuf, String> {
+    let requested = std::path::PathBuf::from(file_path);
+    let resolved = if requested.is_absolute() {
+        requested
+    } else if let Some(source_path) = source_path {
+        let source = std::path::Path::new(source_path);
+        let source_parent = source
+            .parent()
+            .ok_or_else(|| format!("Couldn't determine the source folder for '{}'.", source_path))?;
+        let settings = load_settings_file();
+        crate::transcribe::resolve_output_dir(&settings, source_parent).join(&requested)
+    } else {
+        requested
+    };
+
+    if !resolved.exists() {
+        return Err(format!("Output file no longer exists: {}", resolved.display()));
+    }
+
+    Ok(std::fs::canonicalize(&resolved).unwrap_or(resolved))
+}
+
 #[tauri::command]
-fn open_file_in_editor(app: AppHandle, file_path: String) -> Result<(), String> {
+fn open_file_in_editor(
+    app: AppHandle,
+    file_path: String,
+    source_path: Option<String>,
+) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
-    ensure_directory_exists_if_folder(&file_path);
+
+    let resolved = resolve_output_path(&file_path, source_path.as_deref())?;
+    let resolved_string = resolved.to_string_lossy().to_string();
+    ensure_directory_exists_if_folder(&resolved_string);
 
     #[cfg(target_os = "linux")]
     {
-        if open_in_linux_file_manager(&file_path) {
+        if open_in_linux_file_manager(&resolved_string) {
             return Ok(());
         }
     }
 
     app.opener()
-        .open_path(&file_path, None::<&str>)
-        .map_err(|e| format!("Failed to open file in editor: {}", e))
+        .open_path(&resolved_string, None::<&str>)
+        .map_err(|e| format!("Failed to open output: {}", e))
+}
+
+#[tauri::command]
+fn show_output_in_folder(
+    app: AppHandle,
+    file_path: String,
+    source_path: Option<String>,
+) -> Result<(), String> {
+    let _ = &app;
+    let resolved = resolve_output_path(&file_path, source_path.as_deref())?;
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer.exe")
+            .arg("/select,")
+            .arg(&resolved)
+            .spawn()
+            .map_err(|error| format!("Failed to show output in Explorer: {error}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(&resolved)
+            .spawn()
+            .map_err(|error| format!("Failed to show output in Finder: {error}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use tauri_plugin_opener::OpenerExt;
+        let parent = resolved.parent().unwrap_or(&resolved);
+        let parent_string = parent.to_string_lossy().to_string();
+        if open_in_linux_file_manager(&parent_string) {
+            return Ok(());
+        }
+        return app
+            .opener()
+            .open_path(&parent_string, None::<&str>)
+            .map_err(|e| format!("Failed to open output folder: {}", e));
+    }
+
+    #[allow(unreachable_code)]
+    Err("Showing an output in its folder is not supported on this platform.".to_string())
 }
 
 #[tauri::command]
@@ -1193,11 +1269,8 @@ fn main() {
                     .build(_app)?;
             }
 
-            // Windows/WebView2 can be unreliable when forwarding native file
-            // drag/drop through the JavaScript Webview helper. Listen at the
-            // Rust webview layer and bridge only the small events our frontend
-            // needs. This still uses Tauri's native drag/drop handler, so we
-            // receive real filesystem paths for both files and directories.
+
+            // Native Windows/WebView2 drag/drop bridge.
             if let Some(window) = _app.get_webview_window("main") {
                 let event_window = window.clone();
 
@@ -1289,6 +1362,7 @@ fn main() {
             job_queue::clear_job_queue,
             job_queue::start_job_queue,
             job_queue::cancel_queue_job,
+            job_queue::cancel_job_queue,
 
             history::get_history_entries,
             history::get_history_entry,
@@ -1296,6 +1370,7 @@ fn main() {
             history::clear_history,
 
             speaker_diarization::get_speaker_detection_status,
+            speaker_diarization::warm_speaker_detection,
 
             check_build,
             probe_media_file,
@@ -1333,6 +1408,7 @@ fn main() {
             get_ffmpeg_status,
             copy_to_clipboard,
             open_file_in_editor,
+            show_output_in_folder,
             exit_app,
             hide_to_tray,
             set_window_zoom,

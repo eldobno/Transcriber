@@ -312,28 +312,20 @@ fn convert_speakrs_segments(mut segments: Vec<Segment>) -> Vec<SpeakerSegment> {
     output
 }
 
-fn diarize_samples_with_mode(
-    samples: &[f32],
+fn prepare_pipeline_with_mode(
     cache_dir: &Path,
     mode: ExecutionMode,
-) -> Result<Vec<SpeakerSegment>, String> {
+) -> Result<(), String> {
     let mode_name = mode.as_str().to_string();
 
-    // Fast path: reuse already-loaded ONNX/CUDA sessions. The previous
-    // implementation rebuilt every session for every queue item, which made
-    // short files pay most of their time in initialization.
     {
-        let mut cache = pipeline_cache()
+        let cache = pipeline_cache()
             .lock()
             .map_err(|error| format!("Speaker pipeline cache lock failed: {error}"))?;
-        if let Some(cached) = cache.as_mut() {
+
+        if let Some(cached) = cache.as_ref() {
             if cached.mode_name == mode_name && cached.model_dir.starts_with(cache_dir) {
-                let result = cached.pipeline.run(samples).map_err(|error| {
-                    format!("speakrs {mode_name} Speaker Detection failed: {error}")
-                })?;
-                return Ok(convert_speakrs_segments(
-                    result.discrete_diarization.to_segments(),
-                ));
+                return Ok(());
             }
         }
     }
@@ -354,15 +346,32 @@ fn diarize_samples_with_mode(
     let mut cache = pipeline_cache()
         .lock()
         .map_err(|error| format!("Speaker pipeline cache lock failed: {error}"))?;
+
     *cache = Some(CachedSpeakerPipeline {
-        mode_name: mode_name.clone(),
+        mode_name,
         model_dir,
         pipeline,
     });
 
+    Ok(())
+}
+
+fn diarize_samples_with_mode(
+    samples: &[f32],
+    cache_dir: &Path,
+    mode: ExecutionMode,
+) -> Result<Vec<SpeakerSegment>, String> {
+    let mode_name = mode.as_str().to_string();
+    prepare_pipeline_with_mode(cache_dir, mode)?;
+
+    let mut cache = pipeline_cache()
+        .lock()
+        .map_err(|error| format!("Speaker pipeline cache lock failed: {error}"))?;
+
     let cached = cache
         .as_mut()
         .ok_or_else(|| "Speaker pipeline cache was unexpectedly empty.".to_string())?;
+
     let result = cached.pipeline.run(samples).map_err(|error| {
         format!("speakrs {mode_name} Speaker Detection failed: {error}")
     })?;
@@ -370,6 +379,56 @@ fn diarize_samples_with_mode(
     Ok(convert_speakrs_segments(
         result.discrete_diarization.to_segments(),
     ))
+}
+
+#[tauri::command]
+pub async fn warm_speaker_detection(
+    models_dir: String,
+    backend: String,
+) -> Result<String, String> {
+    let cache_dir = speakrs_cache_dir(&models_dir);
+    let prefer_cuda = backend.eq_ignore_ascii_case("CUDA")
+        && !CUDA_DISABLED_FOR_SESSION.load(Ordering::Acquire);
+
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
+        std::fs::create_dir_all(&cache_dir).map_err(|error| {
+            format!(
+                "Failed to create Speaker Detection model cache '{}': {error}",
+                cache_dir.display()
+            )
+        })?;
+
+        #[cfg(target_os = "windows")]
+        if prefer_cuda {
+            let _ = ensure_windows_cudnn_on_process_path();
+        }
+
+        let primary_mode = if prefer_cuda {
+            ExecutionMode::Cuda
+        } else {
+            ExecutionMode::Cpu
+        };
+        let primary_mode_name = primary_mode.as_str().to_string();
+
+        match prepare_pipeline_with_mode(&cache_dir, primary_mode) {
+            Ok(()) => Ok(primary_mode_name),
+            Err(cuda_error) if prefer_cuda => {
+                CUDA_DISABLED_FOR_SESSION.store(true, Ordering::Release);
+                clear_pipeline_cache();
+
+                prepare_pipeline_with_mode(&cache_dir, ExecutionMode::Cpu).map_err(|cpu_error| {
+                    format!(
+                        "Speaker Detection warm-up failed on CUDA ({cuda_error}) and CPU ({cpu_error})."
+                    )
+                })?;
+
+                Ok("cpu".to_string())
+            }
+            Err(error) => Err(error),
+        }
+    })
+    .await
+    .map_err(|error| format!("Speaker Detection warm-up worker failed: {error}"))?
 }
 
 pub async fn run_speaker_diarization(

@@ -14,8 +14,10 @@ allow = [
   "clear_job_queue",
   "start_job_queue",
   "cancel_queue_job",
+  "cancel_job_queue",
 
   "get_speaker_detection_status",
+  "warm_speaker_detection",
 
   "get_history_entries",
   "get_history_entry",
@@ -64,6 +66,7 @@ allow = [
   "get_ffmpeg_status",
   "copy_to_clipboard",
   "open_file_in_editor",
+  "show_output_in_folder",
   "exit_app",
   "hide_to_tray",
   "set_window_zoom"

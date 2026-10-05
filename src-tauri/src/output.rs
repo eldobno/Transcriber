@@ -134,14 +134,17 @@ fn finalize_audio(
         // Full JSON is an implementation detail unless the user explicitly asks
         // for it in a future advanced output setting.
         let _ = std::fs::remove_file(json_path);
-        return Ok(vec![file_name_string(&desired)?]);
+        return Ok(vec![desired.to_string_lossy().to_string()]);
     }
 
     let Some(txt_name) = generated_files
         .iter()
         .find(|file| file.to_ascii_lowercase().ends_with(".txt"))
     else {
-        return Ok(generated_files.to_vec());
+        return Ok(generated_files
+            .iter()
+            .map(|file| output_dir.join(file).to_string_lossy().to_string())
+            .collect());
     };
 
     let source_txt = output_dir.join(txt_name);
@@ -163,7 +166,7 @@ fn finalize_audio(
         })?;
     }
 
-    Ok(vec![file_name_string(&desired)?])
+    Ok(vec![desired.to_string_lossy().to_string()])
 }
 
 async fn finalize_video(
@@ -391,9 +394,9 @@ async fn finalize_video(
         &format!("Created subtitled video: {}", destination.display()),
     );
 
-    let mut outputs = vec![file_name_string(&destination)?];
+    let mut outputs = vec![destination.to_string_lossy().to_string()];
     if let Some(path) = speaker_transcript_path {
-        outputs.push(file_name_string(&path)?);
+        outputs.push(path.to_string_lossy().to_string());
     }
 
     Ok(outputs)
@@ -500,8 +503,3 @@ fn unique_path(dir: &Path, stem: &str, extension: &str) -> PathBuf {
     dir.join(format!("{stem} ({}).{extension}", std::process::id()))
 }
 
-fn file_name_string(path: &Path) -> Result<String, String> {
-    path.file_name()
-        .map(|value| value.to_string_lossy().to_string())
-        .ok_or_else(|| format!("Output path has no filename: {}", path.display()))
-}

@@ -14,16 +14,30 @@
     "windows": [
       {
         "title": "Transcriber",
-        "width": 800,
-        "height": 600,
-        "dragDropEnabled": true
+        "width": 1100,
+        "height": 740,
+        "dragDropEnabled": true,
+        "minWidth": 820,
+        "minHeight": 600,
+        "label": "main",
+        "decorations": false,
+        "transparent": false,
+        "theme": "Dark",
+        "backgroundColor": [
+          9,
+          11,
+          15,
+          255
+        ]
       }
     ],
     "security": {
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["**"]
+        "scope": [
+          "**"
+        ]
       }
     }
   },
@@ -39,4 +53,3 @@
     ]
   }
 }
-
