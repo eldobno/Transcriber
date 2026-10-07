@@ -1139,7 +1139,7 @@ pub async fn start_job_queue(
                         job.status = JobStatus::Finalizing;
                         job.progress = 1.0;
                         job.message =
-                            Some(crate::output::finalizing_message(&source_path).to_string());
+                            Some(crate::output::finalizing_message(&job_settings, &source_path).to_string());
                         job.error = None;
                     }
 
@@ -1155,6 +1155,7 @@ pub async fn start_job_queue(
                     &result.output_dir,
                     &result.generated_files,
                     speaker_segments.as_deref(),
+                    &job_settings,
                 )
                 .await;
                 let finalization_ms = finalization_started.elapsed().as_millis() as u64;

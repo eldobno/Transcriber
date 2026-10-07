@@ -81,6 +81,15 @@ pub struct WhisperSettings {
     pub output_csv: bool,
     pub output_json: bool,
     pub output_json_full: bool,
+    /// User-facing output defaults used by the Convert dock. These are kept
+    /// separate from whisper.cpp's internal output_* flags because queued jobs
+    /// may need timing JSON internally even when the user only requested TXT.
+    #[serde(default = "default_output_transcript")]
+    pub output_transcript: bool,
+    #[serde(default = "default_output_subtitle_file")]
+    pub output_subtitle_file: bool,
+    #[serde(default = "default_output_subtitled_video")]
+    pub output_subtitled_video: bool,
     pub no_prints: bool,
     pub print_colors: bool,
     pub print_confidence: bool,
@@ -209,6 +218,18 @@ fn default_speaker_cluster_threshold() -> f64 {
     0.5
 }
 
+fn default_output_transcript() -> bool {
+    true
+}
+
+fn default_output_subtitle_file() -> bool {
+    false
+}
+
+fn default_output_subtitled_video() -> bool {
+    true
+}
+
 impl Default for WhisperSettings {
     fn default() -> Self {
         Self::default_settings()
@@ -254,6 +275,9 @@ impl WhisperSettings {
             output_csv: false,
             output_json: false,
             output_json_full: false,
+            output_transcript: true,
+            output_subtitle_file: false,
+            output_subtitled_video: true,
             no_prints: false,
             print_colors: false,
             print_confidence: false,
@@ -303,6 +327,15 @@ impl WhisperSettings {
             "emerald" => "emerald".to_string(),
             _ => "royal-blue".to_string(),
         };
+
+        // Output format preferences are multi-select, but an empty selection
+        // would produce a successful transcription with nothing useful saved.
+        if !self.output_transcript
+            && !self.output_subtitle_file
+            && !self.output_subtitled_video
+        {
+            self.output_transcript = true;
+        }
 
         self.ui_language = match self.ui_language.as_str() {
             "fa" | "es" | "fr" | "de" | "zh" | "ja" | "ru" | "ar" | "pt" | "it" | "tr" | "ko" => {

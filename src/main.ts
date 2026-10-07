@@ -353,6 +353,36 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
                   <input id="speaker-detection" type="checkbox" class="sr-only">
                   <span class="switch-track" aria-hidden="true"><span></span></span>
                 </label>
+                <span class="dock-divider"></span>
+                <div id="output-control" class="dock-output">
+                  <button id="output-trigger" class="output-trigger" type="button" aria-expanded="false" aria-haspopup="true">
+                    <span class="dock-output-copy"><strong>Output</strong><small id="output-summary">TXT + MKV</small></span>
+                    <span class="output-chevron" aria-hidden="true">${icons.chevronDown}</span>
+                  </button>
+                  <div id="output-popover" class="output-popover" hidden>
+                    <div class="output-popover-head">
+                      <div><strong>Output</strong><span>Choose what each conversion saves</span></div>
+                    </div>
+                    <div class="output-options">
+                      <label class="output-option">
+                        <input id="output-transcript" type="checkbox">
+                        <span class="output-check" aria-hidden="true"></span>
+                        <span class="output-option-copy"><strong>Transcript</strong><small>Plain text · .txt</small></span>
+                      </label>
+                      <label class="output-option">
+                        <input id="output-subtitle-file" type="checkbox">
+                        <span class="output-check" aria-hidden="true"></span>
+                        <span class="output-option-copy"><strong>Subtitle file</strong><small>Timed subtitles · .srt</small></span>
+                      </label>
+                      <label class="output-option video-output-option">
+                        <input id="output-subtitled-video" type="checkbox">
+                        <span class="output-check" aria-hidden="true"></span>
+                        <span class="output-option-copy"><strong>Subtitled video</strong><small>Video only · original media + subtitles · .mkv</small></span>
+                      </label>
+                    </div>
+                    <div class="output-popover-note">Saved as your default automatically.</div>
+                  </div>
+                </div>
               </div>
               <button id="start-queue" class="button primary convert-button" type="button" disabled>
                 <span>Convert</span>
@@ -496,6 +526,13 @@ const modelSelect = $("#model-select") as HTMLSelectElement;
 const languageSelect = $("#language-select") as HTMLSelectElement;
 const speakerDetectionCheckbox = $("#speaker-detection") as HTMLInputElement;
 const speakerStatus = $("#speaker-status") as HTMLSpanElement;
+const outputControl = $("#output-control") as HTMLDivElement;
+const outputTrigger = $("#output-trigger") as HTMLButtonElement;
+const outputSummary = $("#output-summary") as HTMLSpanElement;
+const outputPopover = $("#output-popover") as HTMLDivElement;
+const outputTranscriptCheckbox = $("#output-transcript") as HTMLInputElement;
+const outputSubtitleCheckbox = $("#output-subtitle-file") as HTMLInputElement;
+const outputVideoCheckbox = $("#output-subtitled-video") as HTMLInputElement;
 const historySummary = $("#history-summary") as HTMLDivElement;
 const historyContainer = $("#history-list") as HTMLDivElement;
 const historySearch = $("#history-search") as HTMLInputElement;
@@ -651,7 +688,7 @@ function canMove(job: QueueJob): boolean {
 
 function compositeJobProgress(stage: string | undefined, rawProgress: number): number {
   const raw = Math.max(0, Math.min(1, Number.isFinite(rawProgress) ? rawProgress : 0));
-  const withSpeakers = Boolean(settings?.speakerDetection);
+  const withSpeakers = Boolean(settings?.speakerDetection && settings?.outputTranscript);
 
   switch (stage) {
     case "converting":
@@ -681,6 +718,80 @@ function compositeJobProgress(stage: string | undefined, rawProgress: number): n
 
 function isVideoName(name: string): boolean {
   return /\.(mp4|mkv|mov|avi|webm|m4v|wmv|flv|mpeg|mpg)$/i.test(name);
+}
+
+function selectedOutputLabels(fileName?: string): string[] {
+  if (!settings) return ["TXT", "MKV"];
+  const video = fileName ? isVideoName(fileName) : true;
+  const labels: string[] = [];
+  if (Boolean(settings.outputTranscript)) labels.push("TXT");
+  if (Boolean(settings.outputSubtitleFile)) labels.push("SRT");
+  if (video && Boolean(settings.outputSubtitledVideo)) labels.push("MKV");
+
+  // MKV cannot apply to audio. Preserve the zero-click workflow by mirroring
+  // the backend's safe TXT fallback when it is the only global selection.
+  if (!video && labels.length === 0) labels.push("TXT");
+  return labels.length ? labels : ["TXT"];
+}
+
+function actualOutputLabels(paths: string[]): string[] {
+  const labels: string[] = [];
+  for (const path of paths) {
+    const lower = path.toLowerCase();
+    if (lower.endsWith(".txt") && !labels.includes("TXT")) labels.push("TXT");
+    if (lower.endsWith(".srt") && !labels.includes("SRT")) labels.push("SRT");
+    if (lower.endsWith(".mkv") && !labels.includes("MKV")) labels.push("MKV");
+  }
+  return labels;
+}
+
+function outputSummaryForJob(job: QueueJob): string {
+  const actual = actualOutputLabels(job.outputFiles);
+  return (actual.length ? actual : selectedOutputLabels(job.fileName)).join(" + ");
+}
+
+function closeOutputPopover() {
+  outputPopover.hidden = true;
+  outputTrigger.setAttribute("aria-expanded", "false");
+  outputControl.classList.remove("open");
+}
+
+function renderOutputControl() {
+  if (!settings) return;
+  outputTranscriptCheckbox.checked = Boolean(settings.outputTranscript);
+  outputSubtitleCheckbox.checked = Boolean(settings.outputSubtitleFile);
+  outputVideoCheckbox.checked = Boolean(settings.outputSubtitledVideo);
+  outputSummary.textContent = selectedOutputLabels().join(" + ");
+
+  const disabled = queue.running;
+  outputTrigger.disabled = disabled;
+  outputTranscriptCheckbox.disabled = disabled;
+  outputSubtitleCheckbox.disabled = disabled;
+  outputVideoCheckbox.disabled = disabled;
+  if (disabled) closeOutputPopover();
+}
+
+async function applyOutputSelection(changed: HTMLInputElement) {
+  if (!settings) return;
+
+  const transcript = outputTranscriptCheckbox.checked;
+  const subtitle = outputSubtitleCheckbox.checked;
+  const video = outputVideoCheckbox.checked;
+  if (!transcript && !subtitle && !video) {
+    changed.checked = true;
+    showToast("Keep at least one output selected.");
+    return;
+  }
+
+  settings.outputTranscript = transcript;
+  settings.outputSubtitleFile = subtitle;
+  settings.outputSubtitledVideo = video;
+  await persistSettings();
+  renderOutputControl();
+  renderSpeakerDetectionStatus();
+  renderQueue();
+
+  if (settings.speakerDetection && settings.outputTranscript) void warmSpeakerDetection();
 }
 
 function mediaGlyph(fileName: string): string {
@@ -720,18 +831,22 @@ async function ensureVideoThumbnail(icon: HTMLElement) {
 
   let pending = videoThumbnailPending.get(sourcePath);
   if (!pending) {
-    pending = invoke<string>("get_video_thumbnail", { filePath: sourcePath })
+    const request = invoke<string>("get_video_thumbnail", { filePath: sourcePath })
       .then((path: string) => {
         const url = convertFileSrc(path);
         videoThumbnailCache.set(sourcePath, url);
         return url;
       })
       .finally(() => videoThumbnailPending.delete(sourcePath));
-    videoThumbnailPending.set(sourcePath, pending);
+    videoThumbnailPending.set(sourcePath, request);
+    pending = request;
   }
 
+  const request = pending;
+  if (!request) return;
+
   try {
-    const url = await pending!;
+    const url = await request;
     if (icon.isConnected && icon.dataset.videoPreviewPath === sourcePath) attachVideoThumbnail(icon, url);
   } catch {
     icon.classList.add("thumbnail-unavailable");
@@ -808,6 +923,7 @@ function renderModelStatus() {
 
 function speakerStatusText(compact = false): string {
   if (!settings?.speakerDetection) return compact ? "Off" : "Off by default";
+  if (!settings?.outputTranscript) return compact ? "TXT off" : "Enabled · used when Transcript output is selected";
   if (speakerWarmState === "warming") return compact ? "Warming" : "Warming local speaker pipeline…";
   if (speakerWarmState === "error" || speakerDetectionStatusError) return compact ? "Unavailable" : "Speaker Detection is unavailable";
   if (!speakerDetectionStatus) return compact ? "Checking" : "Checking local runtime…";
@@ -876,6 +992,11 @@ function renderSpeakerHealth() {
     healthSpeakerDot.classList.add("muted");
     return;
   }
+  if (!settings?.outputTranscript) {
+    healthSpeaker.textContent = "Waiting for TXT output";
+    healthSpeakerDot.classList.add("muted");
+    return;
+  }
   if (speakerWarmState === "warming") {
     healthSpeaker.textContent = "Warming local pipeline…";
     healthSpeakerDot.classList.add("working");
@@ -931,6 +1052,7 @@ function renderSettings() {
   renderModelOptions();
   renderModelStatus();
   renderSpeakerDetectionStatus();
+  renderOutputControl();
 }
 
 async function persistSettings() {
@@ -993,7 +1115,7 @@ async function setSpeakerDetection(enabled: boolean) {
   }
   renderQueue();
   renderSpeakerHealth();
-  if (enabled) void warmSpeakerDetection();
+  if (enabled && settings.outputTranscript) void warmSpeakerDetection();
 }
 
 function referenceSpeed(): number {
@@ -1148,6 +1270,7 @@ function renderQueue() {
             </div>
             <div class="queue-file-meta">
               ${timing ? `<span>${escapeHtml(timing)}</span>` : ""}
+              <span class="output-chip">${escapeHtml(outputSummaryForJob(job))}</span>
               ${message ? `<span>${escapeHtml(message)}</span>` : ""}
               ${job.error ? `<span class="error-copy">${escapeHtml(job.error)}</span>` : ""}
             </div>
@@ -1242,6 +1365,7 @@ function renderQueue() {
   clearQueueButton.disabled = queue.running || !hasQueue;
   renderModelStatus();
   renderSpeakerDetectionStatus();
+  renderOutputControl();
   setTaskbarProgress();
 }
 
@@ -1363,7 +1487,7 @@ function showToast(message: string, tone: NotificationTone = "info", duration = 
 }
 
 async function warmSpeakerDetection() {
-  if (!settings?.speakerDetection || speakerWarmPromise) return;
+  if (!settings?.speakerDetection || !settings?.outputTranscript || speakerWarmPromise) return;
 
   const modelsDir = String(settings.modelsDir ?? "");
   const backend = settings.selectedBackend === "Standard" ? "Standard" : "CUDA";
@@ -1566,7 +1690,7 @@ async function setupDragAndDrop() {
 
   try {
     const webview = getCurrentWebview();
-    await webview.onDragDropEvent(async (event) => {
+    await webview.onDragDropEvent(async (event: any) => {
       const payload = event.payload;
       if (activeView !== "convert" || queue.running || queuePointerDrag) {
         setDragVisual(false);
@@ -1626,6 +1750,12 @@ async function initialize() {
   loadedSettings.modelPath = modelFileName(selectedModel);
   loadedSettings.speakerDetection = Boolean(loadedSettings.speakerDetection ?? false);
   loadedSettings.speakerCount = 0;
+  loadedSettings.outputTranscript = Boolean(loadedSettings.outputTranscript ?? true);
+  loadedSettings.outputSubtitleFile = Boolean(loadedSettings.outputSubtitleFile ?? false);
+  loadedSettings.outputSubtitledVideo = Boolean(loadedSettings.outputSubtitledVideo ?? true);
+  if (!loadedSettings.outputTranscript && !loadedSettings.outputSubtitleFile && !loadedSettings.outputSubtitledVideo) {
+    loadedSettings.outputTranscript = true;
+  }
   loadedSettings.language = String(loadedSettings.language || "auto");
   loadedSettings.outputDirMode = loadedSettings.outputDirMode === "custom" ? "custom" : "input_dir";
   loadedSettings.outputDirPath = String(loadedSettings.outputDirPath ?? "");
@@ -1638,7 +1768,7 @@ async function initialize() {
   await refreshSpeakerDetectionStatus();
   await refreshQueue();
   wasQueueRunning = queue.running;
-  if (loadedSettings.speakerDetection) void warmSpeakerDetection();
+  if (loadedSettings.speakerDetection && loadedSettings.outputTranscript) void warmSpeakerDetection();
   renderSettings();
   setupMicroInteractions();
   animateViewIn(convertView);
@@ -1764,6 +1894,21 @@ languageSelect.addEventListener("change", () => void applyLanguage(languageSelec
 settingsLanguageSelect.addEventListener("change", () => void applyLanguage(settingsLanguageSelect.value));
 speakerDetectionCheckbox.addEventListener("change", () => void setSpeakerDetection(speakerDetectionCheckbox.checked));
 settingsSpeakerDetectionCheckbox.addEventListener("change", () => void setSpeakerDetection(settingsSpeakerDetectionCheckbox.checked));
+outputTrigger.addEventListener("click", (event) => {
+  event.stopPropagation();
+  if (queue.running) return;
+  const opening = outputPopover.hidden;
+  if (opening) {
+    outputPopover.hidden = false;
+    outputTrigger.setAttribute("aria-expanded", "true");
+    outputControl.classList.add("open");
+  } else {
+    closeOutputPopover();
+  }
+});
+outputTranscriptCheckbox.addEventListener("change", () => void applyOutputSelection(outputTranscriptCheckbox));
+outputSubtitleCheckbox.addEventListener("change", () => void applyOutputSelection(outputSubtitleCheckbox));
+outputVideoCheckbox.addEventListener("change", () => void applyOutputSelection(outputVideoCheckbox));
 settingsDownloadModelButton.addEventListener("click", () => void startModelDownload());
 
 startButton.addEventListener("click", async () => {
@@ -2029,7 +2174,15 @@ backendSelect.addEventListener("change", async () => {
   showToast(backendSelect.value === "CUDA" ? "CUDA selected." : "CPU selected for transcription.");
 });
 
+document.addEventListener("pointerdown", (event) => {
+  if (!outputPopover.hidden && !outputControl.contains(event.target as Node)) closeOutputPopover();
+});
+
 document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !outputPopover.hidden) {
+    closeOutputPopover();
+    return;
+  }
   if (!(event.ctrlKey || event.metaKey) || activeView !== "convert" || queue.running) return;
   if (event.key.toLowerCase() === "o" && !event.shiftKey) {
     event.preventDefault();
